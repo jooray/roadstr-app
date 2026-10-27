@@ -245,7 +245,13 @@ private fun ReportStatus(mesh: NativeShellMesh, host: NativeShellMeshHost, setti
     val state by mesh.runtime.client.state.collectAsState()
     val stats by mesh.runtime.bridge.stats.collectAsState()
     LaunchedEffect(state) { if (state is MeshCoreState.Ready) mesh.runtime.bridge.onRadioReady() }
-    LaunchedEffect(state, host.saved, host.scanning, host.queueRevision, stats.queuedForRelays, stats.publishedToRelays) {
+    // The session only takes a status while the panel is open, and opening it reloads the values: run
+    // again when it opens or when its status differs from the one last written.
+    val session by settingsSession.state.collectAsState()
+    LaunchedEffect(
+        state, host.saved, host.scanning, host.queueRevision, stats.queuedForRelays, stats.publishedToRelays,
+        session.status, session.revision, session.values.mesh,
+    ) {
         // The queue is stored encrypted: count it off the main thread.
         val waiting = withContext(Dispatchers.IO) { mesh.runtime.republish.size() }
         val status = statusOf(mesh, host, state, waiting)

@@ -1,6 +1,7 @@
 package app.roadstr.service.meshcore
 
 import app.roadstr.core.geo.GeoPoint
+import app.roadstr.core.protocol.interop.BridgeSummaryCodec
 import app.roadstr.core.protocol.interop.CompactOutcome
 import app.roadstr.core.protocol.interop.CompactRoadCodec
 import app.roadstr.core.protocol.interop.CompactRoadType
@@ -11,6 +12,7 @@ import app.roadstr.service.nostr.FakeRelayNetwork
 import app.roadstr.service.nostr.ManualScheduler
 import app.roadstr.service.nostr.NativePendingReportStorage
 import app.roadstr.service.nostr.NativeRelayPublisher
+import app.roadstr.service.nostr.NativeRoadEventProtocol
 import app.roadstr.service.nostr.NativeRoadEventService
 import app.roadstr.service.nostr.TestKeys
 import java.nio.ByteBuffer
@@ -19,7 +21,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.runBlocking
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -47,6 +48,9 @@ class RoadMeshBridgeTest {
     private var config = MeshBridgeConfig(receive = true)
     private var position: GeoPoint? = here
     private var limits = MeshBridgeLimits()
+    private var claimResult: Boolean? = true
+    private val claimsAsked = mutableListOf<Pair<String, Int>>()
+    private var claims: BridgeClaims? = BridgeClaims { area, hops -> claimsAsked += area to hops; claimResult }
     private var subs = 0
     private lateinit var bridge: RoadMeshBridge
     private lateinit var client: MeshCoreClient
@@ -73,6 +77,9 @@ class RoadMeshBridgeTest {
             nowSeconds = { clock },
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
             limits = limits,
+            claims = claims,
+            scheduler = scheduler,
+            random = Random(7),
         )
         service.setInteropListener(bridge)
         service.connect()
@@ -398,106 +405,244 @@ class RoadMeshBridgeTest {
         assertEquals(2, shownIds().size)
     }
 
-    // ── relays -> radio ────────────────────────────────────────────────────────────────────────
+    // ── relays -> radio: bridge summaries only ─────────────────────────────────────────────────
+
+    private val summaryConfig = MeshBridgeConfig(receive = true, send = true, nostrToMesh = true)
+
+    /** Someone else's report heard on the radio near here, at [hops] (0: their own radio). */
+    private fun someoneOnTheRadio(n: Int = 50, hops: Int = 0, lat: Int = latE6 + 300) =
+        radio.receive(frame(report(key = key(n), lat = lat, createdAt = clock - 30)), pathLength = hops)
+
+    /** Lets the 2-10 s hold pass. */
+    private fun holdPasses() = scheduler.advance(10_001)
+
+    private fun summariesSent() = sentPayloads().filter { BridgeSummaryCodec.familyOf(it) == BridgeSummaryCodec.Family.Summary }
+
+    private fun decodedSummary(payload: ByteArray) =
+        (BridgeSummaryCodec.decodeSummary(payload) as BridgeSummaryCodec.Result.Ok).value
 
     @Test
-    fun `a report from a relay is put on the radio once, byte for byte`() {
-        config = MeshBridgeConfig(receive = true, send = true, nostrToMesh = true)
+    fun `a relay event is never put on the radio as it is, not even with the bridge on`() {
+        config = summaryConfig
         build()
-        val event = report()
-        relayDelivers(event)
-        relayDelivers(event) // the same event from another relay
-
-        assertEquals(1, radio.sentDatagrams.size)
-        assertArrayEquals(frame(event), sentPayloads().single())
-        assertTrue(service.ledger.wasForwarded(event["id"] as String, RoadEventTransport.MESH))
-        assertEquals(1, bridge.stats.value.sentToRadio)
+        relayDelivers(report())
+        relayDelivers(vote(report(), still = true))
+        holdPasses()
+        assertTrue("no demand, no summary, and never the signed frame", radio.sentDatagrams.isEmpty())
     }
 
     @Test
-    fun `a 46 byte comment goes on the radio in 163 bytes and a 47 byte one stays on the relays`() {
-        limits = MeshBridgeLimits(forwardCooldownSeconds = 1)
-        config = MeshBridgeConfig(receive = true, send = true, nostrToMesh = true)
+    fun `someone heard on the radio gets a zero-hop summary of the relay reports, never the heard one`() {
+        config = summaryConfig
         build()
-        relayDelivers(report(comment = "y".repeat(46)))
-        assertEquals(163, sentPayloads().single().size)
+        val onRelays = report(key = key(1), type = CompactRoadType.ACCIDENT, createdAt = clock - 600)
+        relayDelivers(onRelays)
+        someoneOnTheRadio(hops = 0)
+        assertTrue("the uplink itself never transmits", radio.sentDatagrams.isEmpty())
+        holdPasses()
 
-        clock += 5
-        relayDelivers(report(key = key(1), comment = "y".repeat(47)))
-        assertEquals(1, radio.sentDatagrams.size)
-        assertEquals(1, bridge.stats.value.notRepresentable)
+        val payload = summariesSent().single()
+        assertEquals(13, payload.size)
+        val sent = radio.sentDatagrams.single()
+        assertEquals("zero-hop: path length 0", 0, sent[2].toInt())
+        val entry = decodedSummary(payload).entries.single()
+        assertEquals(CompactRoadType.ACCIDENT.value, entry.category)
+        assertEquals(latE6, entry.latitudeE6)
+        assertEquals(lonE6, entry.longitudeE6)
+        assertEquals(600L, entry.ageSeconds)
+        assertEquals(1, bridge.stats.value.summariesSent)
+        assertEquals(listOf(BridgeSummaryPlanner.areaOf(GeoPoint((latE6 + 300) / 1e6, lonE6 / 1e6)) to 0), claimsAsked)
     }
 
     @Test
-    fun `nothing is put on the radio unless both the bridge and sending are on`() {
+    fun `nothing goes to the radio unless the bridge and sending are both on`() {
         for (cfg in listOf(
             MeshBridgeConfig(receive = true, send = true, nostrToMesh = false),
             MeshBridgeConfig(receive = true, send = false, nostrToMesh = true),
-            MeshBridgeConfig(),
         )) {
             config = cfg
             radio.sentDatagrams.clear()
             subs = 0
             build()
-            relayDelivers(report())
+            relayDelivers(report(key = key(1)))
+            someoneOnTheRadio()
+            holdPasses()
             assertTrue(cfg.toString(), radio.sentDatagrams.isEmpty())
-            assertEquals(cfg.toString(), 1, shownIds().size)
         }
     }
 
     @Test
-    fun `reports far away, without a position or with the radio down are not sent`() {
-        config = MeshBridgeConfig(receive = true, send = true, nostrToMesh = true)
-        build()
-        relayDelivers(report(key = key(2), lat = 48_700_000, lon = 2_200_000))
-        position = null
-        relayDelivers(report(key = key(3), lat = latE6 + 7))
-        assertTrue(radio.sentDatagrams.isEmpty())
-
-        position = here
-        radio.dropLink()
-        relayDelivers(report(key = key(4), lat = latE6 + 9))
-        assertTrue(radio.sentDatagrams.isEmpty())
-    }
-
-    @Test
-    fun `other people's events respect a cooldown and an hourly total, and a refusal costs nothing`() {
-        limits = MeshBridgeLimits(forwardPerHour = 3, forwardPerAuthorPerHour = 10, forwardCooldownSeconds = 20)
-        config = MeshBridgeConfig(receive = true, send = true, nostrToMesh = true)
+    fun `heard through repeaters on a link without regions, nothing is sent rather than a flood`() {
+        config = summaryConfig
         build()
         relayDelivers(report(key = key(1)))
-        relayDelivers(report(key = key(2), lat = latE6 + 1)) // inside the cooldown
-        assertEquals(1, radio.sentDatagrams.size)
-
-        clock += 21
-        relayDelivers(report(key = key(3), lat = latE6 + 2))
-        clock += 21
-        relayDelivers(report(key = key(4), lat = latE6 + 3))
-        assertEquals("the refused one did not eat the hourly total", 3, radio.sentDatagrams.size)
-
-        clock += 21
-        relayDelivers(report(key = key(5), lat = latE6 + 4)) // the hourly total is spent
-        assertEquals(3, radio.sentDatagrams.size)
-        assertTrue(bridge.stats.value.rateLimited >= 2)
-
-        clock += 3_600
-        relayDelivers(report(key = key(6), lat = latE6 + 5, createdAt = clock - 10))
-        assertEquals(4, radio.sentDatagrams.size)
+        someoneOnTheRadio(hops = 2)
+        holdPasses()
+        assertTrue(radio.sentDatagrams.isEmpty())
+        assertEquals(1, bridge.stats.value.summariesWithoutScope)
     }
 
     @Test
-    fun `one author cannot use the radio for more than its share`() {
-        limits = MeshBridgeLimits(forwardPerHour = 50, forwardPerAuthorPerHour = 2, forwardCooldownSeconds = 1)
-        config = MeshBridgeConfig(receive = true, send = true, nostrToMesh = true)
+    fun `one summary per area per half hour, and only with something new`() {
+        config = summaryConfig
         build()
-        for (n in 1..4) {
-            clock += 2
-            relayDelivers(report(key = key(1), lat = latE6 + n))
-        }
-        assertEquals(2, radio.sentDatagrams.size)
-        clock += 2
-        relayDelivers(report(key = key(2), lat = latE6 + 9))
-        assertEquals("another author still gets through", 3, radio.sentDatagrams.size)
+        relayDelivers(report(key = key(1)))
+        someoneOnTheRadio(n = 50)
+        holdPasses()
+        assertEquals(1, summariesSent().size)
+
+        clock += 10 * 60
+        relayDelivers(report(key = key(2), lat = latE6 + 5_000, createdAt = clock - 5))
+        someoneOnTheRadio(n = 51)
+        holdPasses()
+        assertEquals("inside the 30 minutes", 1, summariesSent().size)
+
+        clock += 21 * 60
+        someoneOnTheRadio(n = 52)
+        holdPasses()
+        assertEquals(2, summariesSent().size)
+        val second = decodedSummary(summariesSent().last()).entries
+        assertEquals("the new report first, the repeat after it", 2, second.size)
+        assertEquals(latE6 + 5_000, second.first().latitudeE6)
+
+        clock += 31 * 60
+        someoneOnTheRadio(n = 53)
+        holdPasses()
+        assertEquals("nothing new for the area: no summary", 2, summariesSent().size)
+    }
+
+    @Test
+    fun `demand older than two hours, or far from the bridge, is not demand`() {
+        config = summaryConfig
+        build()
+        relayDelivers(report(key = key(1)))
+        someoneOnTheRadio(lat = latE6 + 400_000) // 44 km north
+        holdPasses()
+        assertTrue(radio.sentDatagrams.isEmpty())
+
+        position = null
+        someoneOnTheRadio(n = 51)
+        holdPasses()
+        assertTrue("no position fix, no summary", radio.sentDatagrams.isEmpty())
+    }
+
+    @Test
+    fun `a request is answered, again after ten minutes, with its filters`() {
+        config = summaryConfig
+        build()
+        relayDelivers(report(key = key(1), type = CompactRoadType.POLICE))
+        relayDelivers(report(key = key(2), type = CompactRoadType.SPEED_CAMERA, lat = latE6 + 900, createdAt = clock - 50))
+        val ask = BridgeSummaryCodec.encodeRequest(latE6, lonE6, 10, null, listOf(CompactRoadType.POLICE.value))
+        radio.receive(ask, pathLength = 0)
+        holdPasses()
+        val first = decodedSummary(summariesSent().single()).entries
+        assertEquals(listOf(CompactRoadType.POLICE.value), first.map { it.category })
+        assertEquals(1, bridge.stats.value.requestsHeard)
+
+        clock += 11 * 60
+        relayDelivers(report(key = key(3), type = CompactRoadType.POLICE, lat = latE6 + 1_000, createdAt = clock - 5))
+        radio.receive(BridgeSummaryCodec.encodeRequest(latE6, lonE6, 10, 3_600, emptyList()), pathLength = 0)
+        holdPasses()
+        assertEquals(2, summariesSent().size)
+    }
+
+    @Test
+    fun `another bridge's summary heard during the wait takes the area`() {
+        config = summaryConfig
+        build()
+        relayDelivers(report(key = key(1)))
+        someoneOnTheRadio()
+        val theirs = (BridgeSummaryCodec.encodeSummary(
+            latE6, lonE6,
+            listOf(BridgeSummaryCodec.Entry(latE6 + 2_000, lonE6, CompactRoadType.HAZARD.value, 60, 3_000, 0, 0)),
+        ) as BridgeSummaryCodec.Result.Ok).value
+        radio.receive(theirs, pathLength = 1)
+        holdPasses()
+        assertTrue(summariesSent().isEmpty())
+        assertEquals(1, bridge.stats.value.summariesHeard)
+    }
+
+    @Test
+    fun `a lost claim or no relay means no summary`() {
+        config = summaryConfig
+        claimResult = false
+        build()
+        relayDelivers(report(key = key(1)))
+        someoneOnTheRadio(n = 50)
+        holdPasses()
+        claimResult = null
+        clock += 60
+        someoneOnTheRadio(n = 51, lat = latE6 - 60_000) // 6.7 km south, another geohash-4 cell
+        holdPasses()
+        assertTrue(radio.sentDatagrams.isEmpty())
+        assertEquals(2, bridge.stats.value.summariesYielded)
+    }
+
+    @Test
+    fun `without a way to agree with other bridges, no summary is ever sent`() {
+        config = summaryConfig
+        claims = null
+        build()
+        relayDelivers(report(key = key(1)))
+        someoneOnTheRadio()
+        holdPasses()
+        assertTrue(radio.sentDatagrams.isEmpty())
+    }
+
+    @Test
+    fun `our own report given back by a repeater is not demand`() {
+        config = summaryConfig
+        build()
+        relayDelivers(report(key = key(1)))
+        val own = report(key = key(9), lat = latE6 + 700)
+        bridge.sendOwn(own)
+        radio.sentDatagrams.clear()
+        radio.receive(frame(own), pathLength = 0)
+        holdPasses()
+        assertTrue(radio.sentDatagrams.isEmpty())
+    }
+
+    // ── bridge summaries heard on the radio ────────────────────────────────────────────────────
+
+    @Test
+    fun `a summary heard on the radio is shown as unverified and goes nowhere else`() {
+        config = MeshBridgeConfig(receive = true, send = true, meshToNostr = true, nostrToMesh = true)
+        build()
+        val summary = (BridgeSummaryCodec.encodeSummary(
+            latE6, lonE6,
+            listOf(BridgeSummaryCodec.Entry(latE6 + 5_000, lonE6, CompactRoadType.POLICE.value, 600, 3_000, 2, 0)),
+        ) as BridgeSummaryCodec.Result.Ok).value
+        radio.receive(summary, pathLength = 0)
+        holdPasses()
+
+        val shown = service.events.value.single()
+        assertEquals(NativeRoadEventProtocol.Bridge, shown.protocol)
+        assertTrue(shown.id.matches(Regex("^bridge:[0-9a-f]{16}$")))
+        assertEquals("", shown.pubkey)
+        assertEquals(clock - 600, shown.createdAt)
+        assertEquals(2, shown.confirmations)
+        assertTrue("never published", relayEchoes().isEmpty())
+        assertEquals(0, queue.size())
+        assertTrue("never re-sent, and a summary is not demand", radio.sentDatagrams.isEmpty())
+        assertFalse(service.ledger.seenOn(shown.id, RoadEventTransport.MESH))
+    }
+
+    @Test
+    fun `a verified report nearby wins over a bridge entry, before and after`() {
+        config = MeshBridgeConfig(receive = true)
+        build()
+        fun summaryAt(lat: Int) = (BridgeSummaryCodec.encodeSummary(
+            latE6, lonE6, listOf(BridgeSummaryCodec.Entry(lat, lonE6, CompactRoadType.POLICE.value, 60, 3_000, 0, 0)),
+        ) as BridgeSummaryCodec.Result.Ok).value
+        relayDelivers(report(key = key(1)))
+        radio.receive(summaryAt(latE6 + 50), pathLength = 0) // 5 m from the verified one
+        assertEquals(1, service.events.value.size)
+        assertTrue(service.events.value.single().protocol != NativeRoadEventProtocol.Bridge)
+
+        radio.receive(summaryAt(latE6 + 5_000), pathLength = 0) // 550 m away: shown
+        assertEquals(2, service.events.value.size)
+        relayDelivers(report(key = key(2), lat = latE6 + 5_200)) // a verified one 22 m from it
+        assertTrue(service.events.value.none { it.protocol == NativeRoadEventProtocol.Bridge })
     }
 
     // ── no loops, in any order ─────────────────────────────────────────────────────────────────
@@ -507,25 +652,13 @@ class RoadMeshBridgeTest {
         config = MeshBridgeConfig(receive = true, send = true, meshToNostr = true, nostrToMesh = true)
         build()
         val event = report()
-        radio.receive(frame(event))
+        radio.receive(frame(event), pathLength = 0)
         relayDelivers(relayEchoes().single())
+        holdPasses() // the demand finds only a report the radio already has
 
         assertTrue("no storm", radio.sentDatagrams.isEmpty())
         assertEquals(1, relayEchoes().size)
         assertEquals(setOf(RoadEventTransport.MESH, RoadEventTransport.RELAY), service.events.value.single().transports)
-    }
-
-    @Test
-    fun `relay to radio and back, the radio echo is not republished`() {
-        config = MeshBridgeConfig(receive = true, send = true, meshToNostr = true, nostrToMesh = true)
-        build()
-        val event = report()
-        relayDelivers(event)
-        assertEquals(1, radio.sentDatagrams.size)
-        radio.receive(frame(event)) // a repeater gives our own transmission back
-        assertTrue(relayEchoes().isEmpty())
-        assertEquals(0, queue.size())
-        assertEquals(1, radio.sentDatagrams.size)
     }
 
     @Test
@@ -614,7 +747,7 @@ class RoadMeshBridgeTest {
         radio.sendMode = FakeMeshCoreRadio.SendMode.UnsupportedCommand
         build()
         val event = report()
-        relayDelivers(event)
+        bridge.sendOwn(event)
         assertTrue(client.state.value is MeshCoreState.Failed)
         assertFalse(service.ledger.wasForwarded(event["id"] as String, RoadEventTransport.MESH))
         assertEquals(0, bridge.stats.value.sentToRadio)
@@ -625,7 +758,7 @@ class RoadMeshBridgeTest {
         config = MeshBridgeConfig(receive = true, send = true, nostrToMesh = true)
         radio.sendMode = FakeMeshCoreRadio.SendMode.IllegalArgument
         build()
-        relayDelivers(report())
+        bridge.sendOwn(report())
         assertEquals(1, bridge.stats.value.tooLarge)
         assertEquals(0, bridge.stats.value.sentToRadio)
     }
@@ -636,7 +769,7 @@ class RoadMeshBridgeTest {
         radio.sendMode = FakeMeshCoreRadio.SendMode.Silent
         build()
         val event = report()
-        relayDelivers(event)
+        bridge.sendOwn(event)
         radio.dropLink()
         assertFalse(service.ledger.wasForwarded(event["id"] as String, RoadEventTransport.MESH))
         assertEquals(0, bridge.stats.value.sentToRadio)

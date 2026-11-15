@@ -1,5 +1,6 @@
 package app.roadstr.service.meshcore
 
+import app.roadstr.core.protocol.interop.LoRaSettings
 import app.roadstr.core.protocol.meshcore.MeshCoreCompanionProtocol as Protocol
 import app.roadstr.service.nostr.NativeScheduledTask
 import app.roadstr.service.nostr.NativeScheduler
@@ -116,6 +117,12 @@ enum class MeshCoreSendResult {
 
     /** The link dropped before the radio answered: it may or may not have been sent. */
     Lost,
+
+    /**
+     * A bridge summary could not be limited to zero hops or a region on this link, so it was not
+     * sent: summaries never go out as a plain flood.
+     */
+    NoScope,
 }
 
 class MeshCoreDatagram(
@@ -270,6 +277,10 @@ class MeshCoreClient(
         enqueueLocked(Protocol.deviceQuery(), { it is Protocol.Inbound.DeviceInfo }) { reply ->
             val details = reply as? Protocol.Inbound.DeviceInfo ?: return@enqueueLocked handshakeFailed(reply)
             device = MeshCoreDevice(info.name, info.publicKeyPrefix, details.firmwareCode, details.version, details.model)
+            loRaSettings = run {
+                val settings = LoRaSettings(info.spreadingFactor ?: 0, info.bandwidthHz ?: 0, info.codingRate ?: 0)
+                settings.takeIf { it.plausible }
+            }
             val slots = (details.maxChannels ?: Protocol.CHANNEL_SLOTS).coerceIn(1, Protocol.CHANNEL_SLOTS)
             findChannelLocked(0, slots)
         }
@@ -452,7 +463,28 @@ class MeshCoreClient(
      * Offers [payload] to the radio as a flood datagram on the Roadstr channel. [onResult] is
      * called once, from whatever thread the answer arrives on.
      */
-    override fun send(payload: ByteArray, onResult: (MeshCoreSendResult) -> Unit) {
+    override fun send(payload: ByteArray, onResult: (MeshCoreSendResult) -> Unit) = send(payload, zeroHop = false, onResult)
+
+    /** This link owns the radio and can send with path length 0. */
+    override val zeroHop: Boolean get() = true
+
+    @Volatile
+    private var loRaSettings: LoRaSettings? = null
+
+    override val loRa: LoRaSettings? get() = loRaSettings
+
+    /**
+     * A bridge summary: zero-hop only. The companion link has no per-message flood region, so a
+     * region-scoped summary is refused ([MeshCoreSendResult.NoScope]) instead of flooded.
+     */
+    override fun sendSummary(payload: ByteArray, scope: SummaryScope, onResult: (MeshCoreSendResult) -> Unit) {
+        when (scope) {
+            SummaryScope.ZeroHop -> send(payload, zeroHop = true, onResult)
+            is SummaryScope.Region -> onResult(MeshCoreSendResult.NoScope)
+        }
+    }
+
+    private fun send(payload: ByteArray, zeroHop: Boolean, onResult: (MeshCoreSendResult) -> Unit) {
         locked {
             val slot = channelIndex
             val ready = _state.value is MeshCoreState.Ready
@@ -460,7 +492,14 @@ class MeshCoreClient(
                 !ready || slot == null -> deferred += { onResult(MeshCoreSendResult.NotReady) }
                 payload.isEmpty() || payload.size > Protocol.MAX_CHANNEL_DATA_PAYLOAD ->
                     deferred += { onResult(MeshCoreSendResult.TooLarge) }
-                else -> sendLocked(Protocol.sendChannelData(slot, sendDataType, payload), attemptsLeft = SEND_ATTEMPTS, onResult)
+                else -> {
+                    val frame = if (zeroHop) {
+                        Protocol.sendChannelDataZeroHop(slot, sendDataType, payload)
+                    } else {
+                        Protocol.sendChannelData(slot, sendDataType, payload)
+                    }
+                    sendLocked(frame, attemptsLeft = SEND_ATTEMPTS, onResult)
+                }
             }
         }
     }

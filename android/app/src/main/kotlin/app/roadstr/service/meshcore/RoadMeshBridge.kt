@@ -3,20 +3,23 @@ package app.roadstr.service.meshcore
 import app.roadstr.core.geo.GeoMath
 import app.roadstr.core.geo.GeoPoint
 import app.roadstr.core.protocol.interop.BridgeRateLimiter
+import app.roadstr.core.protocol.interop.BridgeSummaryCodec
 import app.roadstr.core.protocol.interop.CompactConfirmation
 import app.roadstr.core.protocol.interop.CompactCoordinates
 import app.roadstr.core.protocol.interop.CompactError
 import app.roadstr.core.protocol.interop.CompactOutcome
 import app.roadstr.core.protocol.interop.CompactReport
 import app.roadstr.core.protocol.interop.CompactRoadCodec
+import app.roadstr.core.protocol.interop.CompactRoadType
 import app.roadstr.core.protocol.interop.ExternalRoadReportAdapter
 import app.roadstr.core.protocol.interop.InteropLifetime
+import app.roadstr.core.protocol.interop.LoRaSettings
 import app.roadstr.core.protocol.interop.RoadEventTransport
-import app.roadstr.core.protocol.interop.tryAcquireAll
 import app.roadstr.service.nostr.NativeInteropListener
 import app.roadstr.service.nostr.NativeNostrWire
 import app.roadstr.service.nostr.NativeRoadEvent
 import app.roadstr.service.nostr.NativeRoadEventService
+import app.roadstr.service.nostr.NativeScheduler
 import java.security.MessageDigest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,7 +36,10 @@ data class MeshBridgeConfig(
     val send: Boolean = false,
     /** Republish what is heard on the radio to the Nostr relays, with the original author. */
     val meshToNostr: Boolean = false,
-    /** Put reports seen on the relays onto the radio (needs [send]). */
+    /**
+     * Relays -> radio as bridge summaries (needs [send]): short, unsigned, on demand only, zero-hop
+     * or region-scoped. Never the signed events and never votes.
+     */
     val nostrToMesh: Boolean = false,
 )
 
@@ -41,15 +47,10 @@ data class MeshBridgeConfig(
 data class MeshBridgeLimits(
     /** Frames taken from the radio per minute; the rest are dropped unread. */
     val ingestPerMinute: Int = 60,
-    /** Other people's events put on the radio, per hour and in total. */
-    val forwardPerHour: Int = 20,
-    val forwardPerAuthorPerHour: Int = 4,
-    /** Minimum gap between two transmissions of other people's events. */
-    val forwardCooldownSeconds: Long = 20,
     /** This device's own reports and votes: a loose guard against a runaway loop, not a quota. */
     val ownPerMinute: Int = 6,
-    /** Only events this close to the driver are put on the radio: it is a local medium. */
-    val forwardRadiusMeters: Double = 40_000.0,
+    /** Relays -> radio, as summaries only. */
+    val summaries: BridgeSummaryLimits = BridgeSummaryLimits(),
     /** Only events this close are republished to relays from the radio. */
     val republishRadiusMeters: Double = 250_000.0,
 )
@@ -69,13 +70,50 @@ data class MeshBridgeStats(
     val notRepresentable: Int = 0,
     /** Frames the radio refused as too large. The encoder keeps to 163 bytes, so this stays 0. */
     val tooLarge: Int = 0,
+    /** Bridge summaries heard on the radio, and the unverified reports they brought. */
+    val summariesHeard: Int = 0,
+    val bridgeEntriesShown: Int = 0,
+    val requestsHeard: Int = 0,
+    /** Bridge summaries this device put on the radio. */
+    val summariesSent: Int = 0,
+    /** Summaries not sent because another bridge took the area, or no scope or relay was available. */
+    val summariesYielded: Int = 0,
+    val summariesWithoutScope: Int = 0,
 )
+
+/** How far a bridge summary may travel. Never a plain flood. */
+sealed interface SummaryScope {
+    /** Only the bridge's radio neighbours: path length 0, no repeater forwards it. */
+    data object ZeroHop : SummaryScope
+
+    /** Flooded only inside the flood region that covers [point]. */
+    data class Region(val point: GeoPoint) : SummaryScope
+}
 
 /** The radio, as the bridge needs it. */
 interface MeshRadioPort {
     val ready: Boolean
 
     fun send(payload: ByteArray, onResult: (MeshCoreSendResult) -> Unit)
+
+    /** Whether this link can send zero-hop. */
+    val zeroHop: Boolean get() = false
+
+    /** The radio's LoRa settings, for the airtime budget; null when unknown. */
+    val loRa: LoRaSettings? get() = null
+
+    /** Sends a bridge summary within [scope], or refuses with [MeshCoreSendResult.NoScope]. */
+    fun sendSummary(payload: ByteArray, scope: SummaryScope, onResult: (MeshCoreSendResult) -> Unit) =
+        onResult(MeshCoreSendResult.NoScope)
+}
+
+/**
+ * Agreement between bridges over Nostr about who sends the summary for an area (SPECIFICATION.md
+ * 4.3 rule 7). True: this bridge won. False: another one did. Null: no relay could be reached, so
+ * this bridge has nothing current from the relays and sends nothing.
+ */
+fun interface BridgeClaims {
+    suspend fun contest(area: String, hops: Int): Boolean?
 }
 
 /**
@@ -87,7 +125,11 @@ interface MeshRadioPort {
  *    verified before anything uses it, and nothing is forwarded that did not verify;
  *  - the author, ID and signature never change: the bridge does not sign, ever;
  *  - nothing is sent anywhere that already has it (the ledger), so relay -> radio -> relay cannot
- *    cycle, and every outgoing direction has a rate limit, a cooldown and an area;
+ *    cycle, and every outgoing direction has a rate limit and an area;
+ *  - relays -> radio carries only bridge summaries (SPECIFICATION.md 4.2-4.3 in jooray/roadbeacon):
+ *    unsigned, on demand, zero-hop or region-scoped, within an airtime budget, one bridge per area;
+ *    never a relay event's signed frame and never a vote;
+ *  - receiving and bridging radio -> relays never transmits on the radio;
  *  - everything is off until the user turns it on, and a frame that is not exactly the format is
  *    dropped, never repaired.
  *
@@ -102,15 +144,18 @@ class RoadMeshBridge(
     private val nowSeconds: () -> Long,
     private val scope: CoroutineScope,
     private val limits: MeshBridgeLimits = MeshBridgeLimits(),
+    /** Who sends the summary for an area; null: no agreement possible, so no summaries. */
+    private val claims: BridgeClaims? = null,
+    /** Runs the random wait before a summary; null runs it at once (tests that do not care). */
+    private val scheduler: NativeScheduler? = null,
+    private val random: java.util.Random = java.security.SecureRandom(),
 ) : NativeInteropListener {
     private val lock = Any()
     private val ingest = BridgeRateLimiter(limits.ingestPerMinute, 60)
-    private val forwards = BridgeRateLimiter(limits.forwardPerHour, 3_600)
-    private val cooldown = BridgeRateLimiter(1, limits.forwardCooldownSeconds.coerceAtLeast(1))
     private val own = BridgeRateLimiter(limits.ownPerMinute, 60)
-    private val perAuthor = object : LinkedHashMap<String, BridgeRateLimiter>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, BridgeRateLimiter>) = size > MAX_AUTHORS
-    }
+    private val planner = BridgeSummaryPlanner(limits.summaries)
+    /** Areas with a summary on its way (waiting, claiming or sending). */
+    private val summaryInFlight = HashSet<String>()
     private val frames = object : LinkedHashMap<String, Boolean>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>) = size > MAX_FRAME_DIGESTS
     }
@@ -138,16 +183,56 @@ class RoadMeshBridge(
         val digest = digestOf(datagram.payload)
         val repeated = synchronized(lock) { frames.put(digest, true) != null }
         if (repeated) return
+        when (BridgeSummaryCodec.familyOf(datagram.payload)) {
+            BridgeSummaryCodec.Family.Summary -> return acceptSummary(datagram.payload, now)
+            BridgeSummaryCodec.Family.Request -> return acceptRequest(datagram, now)
+            BridgeSummaryCodec.Family.Unknown -> return bump { copy(malformed = malformed + 1) }
+            BridgeSummaryCodec.Family.Signed -> Unit
+        }
         when (val outcome = CompactRoadCodec.decode(datagram.payload)) {
             is CompactOutcome.Failed -> countFailure(outcome.error)
             is CompactOutcome.Ok -> when (val decoded = outcome.value) {
-                is CompactReport -> acceptReport(decoded, now)
-                is CompactConfirmation -> acceptVote(decoded, now)
+                is CompactReport -> acceptReport(decoded, now, datagram.hops)
+                is CompactConfirmation -> acceptVote(decoded, now, datagram.hops)
             }
         }
     }
 
-    private fun acceptReport(decoded: CompactReport, now: Long) {
+    /**
+     * Another bridge's summary: its entries are shown as unverified, never republished, never
+     * re-sent, and its area counts as served.
+     */
+    private fun acceptSummary(payload: ByteArray, now: Long) {
+        val summary = (BridgeSummaryCodec.decodeSummary(payload) as? BridgeSummaryCodec.Result.Ok)?.value
+            ?: return bump { copy(malformed = malformed + 1) }
+        bump { copy(summariesHeard = summariesHeard + 1) }
+        val ref = GeoPoint(CompactCoordinates.degrees(summary.refLatitudeE6), CompactCoordinates.degrees(summary.refLongitudeE6))
+        synchronized(lock) { planner.noteSummaryHeard(ref, now) }
+        val shown = roads.acceptBridgeSummary(summary.entries, now)
+        if (shown > 0) bump { copy(bridgeEntriesShown = bridgeEntriesShown + shown) }
+    }
+
+    /** A driver on the mesh asks for a summary. Never published anywhere. */
+    private fun acceptRequest(datagram: MeshCoreDatagram, now: Long) {
+        val request = (BridgeSummaryCodec.decodeRequest(datagram.payload) as? BridgeSummaryCodec.Result.Ok)?.value
+            ?: return bump { copy(malformed = malformed + 1) }
+        bump { copy(requestsHeard = requestsHeard + 1) }
+        if (!summariesWanted()) return
+        val demand = synchronized(lock) { planner.noteRequest(request, datagram.hops, position(), now) } ?: return
+        scheduleSummary(demand.area)
+    }
+
+    /** A signed frame from another node: someone uses the mesh at [where]. Only schedules; never sends now. */
+    private fun noteDemand(eventId: String?, where: GeoPoint?, hops: Int?, now: Long) {
+        if (!summariesWanted()) return
+        // Our own transmission given back by a repeater is not someone else on the mesh.
+        if (eventId != null && roads.ledger.wasForwarded(eventId, RoadEventTransport.MESH)) return
+        val bridgeAt = position() ?: return
+        val demand = synchronized(lock) { planner.noteSignedFrame(where ?: bridgeAt, hops, bridgeAt, now) } ?: return
+        scheduleSummary(demand.area)
+    }
+
+    private fun acceptReport(decoded: CompactReport, now: Long, hops: Int?) {
         val report = (ExternalRoadReportAdapter.adaptReport(decoded.event) as? CompactOutcome.Ok)?.value
             ?: return bump { copy(malformed = malformed + 1) }
         // A replay of an old frame, or a clock that is wrong by more than a few minutes, is noise.
@@ -159,12 +244,15 @@ class RoadMeshBridge(
         val where = GeoPoint(CompactCoordinates.degrees(report.latitudeE6), CompactCoordinates.degrees(report.longitudeE6))
         val shownUntil = minOf(report.createdAt + report.type.effectiveTtlSeconds, report.relayExpiration)
         republishIfAllowed(decoded.event, shownUntil, where)
+        noteDemand(decoded.event["id"] as? String, where, hops, now)
     }
 
-    private fun acceptVote(decoded: CompactConfirmation, now: Long) {
+    private fun acceptVote(decoded: CompactConfirmation, now: Long, hops: Int?) {
         val createdAt = NativeNostrWire.integral(decoded.event["created_at"]) ?: return
         val tooNew = createdAt > now + InteropLifetime.MAX_FUTURE_SKEW_SECONDS
         if (tooNew || now - createdAt > MAX_VOTE_AGE_SECONDS) return bump { copy(stale = stale + 1) }
+        // A vote carries no position: the demand is where the bridge is.
+        noteDemand(decoded.event["id"] as? String, null, hops, now)
         // The vote frame is self-contained and already verified; only its report may be missing.
         val report = roads.find(decoded.referencedEventId) ?: return park(decoded, now)
         applyVote(decoded, report, now)
@@ -250,36 +338,98 @@ class RoadMeshBridge(
         if (published > 0) bump { copy(publishedToRelays = publishedToRelays + published) }
     }
 
-    // ── relays -> radio ─────────────────────────────────────────────────────────────────────────
+    // ── relays -> radio: bridge summaries only ─────────────────────────────────────────────────
 
-    /** The service accepted an event: release votes that waited for it, and maybe put it on the radio. */
+    /** The service accepted an event: release votes that waited for it. Relay events are never put on the radio as they are. */
     override fun onInteropEvent(event: Map<String, Any?>, via: RoadEventTransport, newOnTransport: Boolean) {
         val id = event["id"] as? String ?: return
         val report = NativeNostrWire.integral(event["kind"]) == CompactRoadCodec.KIND_REPORT.toLong()
         // Off the relay thread and off the service's lock.
         if (report) scope.launch { applyParked(id) }
-        if (!report || via != RoadEventTransport.RELAY || !newOnTransport) return
-        scope.launch { considerForwardingToRadio(event) }
     }
 
-    private fun considerForwardingToRadio(event: Map<String, Any?>) {
+    private fun summariesWanted(): Boolean {
         val cfg = config()
-        if (!cfg.nostrToMesh || !cfg.send || !radio.ready) return
-        val id = event["id"] as? String ?: return
-        if (!roads.ledger.shouldForward(id, RoadEventTransport.MESH)) return
-        val prepared = prepare(event) ?: return
-        val now = nowSeconds()
-        val where = prepared.where ?: return
-        if (!insideForwardArea(where) || !prepared.live(now)) return
-        val allowed = synchronized(lock) { withinForwardQuota(prepared.author, now) }
-        if (!allowed) return bump { copy(rateLimited = rateLimited + 1) }
-        transmit(id, prepared.frame)
+        return cfg.nostrToMesh && cfg.send && claims != null
     }
 
-    /** All three gates must pass for the same event, and none is spent unless all do. */
-    private fun withinForwardQuota(author: String, now: Long): Boolean {
-        val authorLimiter = perAuthor.getOrPut(author) { BridgeRateLimiter(limits.forwardPerAuthorPerHour, 3_600) }
-        return tryAcquireAll(now, authorLimiter, forwards, cooldown)
+    /** Waits 2-10 s at random, then tries; one attempt per area at a time. */
+    private fun scheduleSummary(area: String) {
+        val first = synchronized(lock) { summaryInFlight.add(area) }
+        if (!first) return
+        val hold = synchronized(lock) { planner.holdMillis(random) }
+        val run = { scope.launch { try { attemptSummary(area) } finally { synchronized(lock) { summaryInFlight.remove(area) } } } }
+        val timer = scheduler
+        if (timer == null) run() else timer.schedule(hold) { run() }
+    }
+
+    private suspend fun attemptSummary(area: String) {
+        if (!summariesWanted() || !radio.ready) return
+        val agreement = claims ?: return
+        val now = nowSeconds()
+        val selection = synchronized(lock) {
+            val demand = planner.due(area, now) ?: return
+            planner.select(demand, candidates(), now)
+        } ?: return
+        val demand = selection.demand
+        val point = selection.demand.point
+        val payload = (BridgeSummaryCodec.encodeSummary(
+            BridgeSummaryPlanner.e6(point.latitude), BridgeSummaryPlanner.e6(point.longitude), selection.entries,
+        ) as? BridgeSummaryCodec.Result.Ok)?.value ?: return bump { copy(notRepresentable = notRepresentable + 1) }
+        // Zero-hop reaches the asker only if it was heard directly; otherwise the region around it.
+        val summaryScope = if (radio.zeroHop && demand.hops == 0) SummaryScope.ZeroHop else SummaryScope.Region(point)
+        if (summaryScope is SummaryScope.Region && radio.zeroHop) {
+            // The link that owns the radio has no per-message region: it would have to flood.
+            return bump { copy(summariesWithoutScope = summariesWithoutScope + 1) }
+        }
+        val settings = radio.loRa ?: LoRaSettings.ASSUMED
+        val packet = BridgeSummaryCodec.packetBytes(payload.size, region = summaryScope is SummaryScope.Region)
+        val airtime = BridgeSummaryCodec.airtimeMillis(settings.spreadingFactor, settings.bandwidthHz, settings.codingRate, packet)
+        if (!synchronized(lock) { planner.budgetAllows(airtime, now) }) return bump { copy(rateLimited = rateLimited + 1) }
+
+        when (agreement.contest(area, demand.hops)) {
+            null -> return bump { copy(summariesYielded = summariesYielded + 1) }
+            false -> {
+                synchronized(lock) { planner.noteClaimLost(area, nowSeconds()) }
+                return bump { copy(summariesYielded = summariesYielded + 1) }
+            }
+            true -> Unit
+        }
+        // Another bridge's summary for the area may have been heard during the claim.
+        val sendAt = nowSeconds()
+        val stillDue = synchronized(lock) { planner.due(area, sendAt) != null && planner.budgetAllows(airtime, sendAt) }
+        if (!stillDue || !summariesWanted()) return
+        radio.sendSummary(payload, summaryScope) { result ->
+            when (result) {
+                MeshCoreSendResult.Sent -> {
+                    synchronized(lock) { planner.recordSent(selection, airtime, nowSeconds()) }
+                    bump { copy(summariesSent = summariesSent + 1) }
+                }
+                MeshCoreSendResult.NoScope -> bump { copy(summariesWithoutScope = summariesWithoutScope + 1) }
+                MeshCoreSendResult.TooLarge -> bump { copy(tooLarge = tooLarge + 1) }
+                else -> Unit
+            }
+        }
+    }
+
+    /** Verified reports from the relays that the radio has not carried, as the planner needs them. */
+    private fun candidates(): List<SummaryCandidate> = roads.bridgeCandidates().mapNotNull { event ->
+        if (roads.ledger.seenOn(event.id, RoadEventTransport.MESH) || roads.ledger.wasForwarded(event.id, RoadEventTransport.MESH)) {
+            return@mapNotNull null
+        }
+        val type = CompactRoadType.fromNative(event.category) ?: return@mapNotNull null
+        val shownUntil = event.lifetimeEndsAt
+            ?: minOf(event.createdAt + event.category.ttlSeconds, event.expiresAt ?: Long.MAX_VALUE)
+        SummaryCandidate(
+            id = event.id,
+            category = type.value,
+            latitudeE6 = BridgeSummaryPlanner.e6(event.latitude),
+            longitudeE6 = BridgeSummaryPlanner.e6(event.longitude),
+            createdAt = event.createdAt,
+            shownUntil = shownUntil,
+            stillThere = event.confirmations,
+            gone = event.denials,
+        )
     }
 
     // ── this device's own events ────────────────────────────────────────────────────────────────
@@ -362,11 +512,6 @@ class RoadMeshBridge(
         return Prepared(frame, author, null, vote.referencedEventId, createdAt + CONFIRMATION_REPUBLISH_SECONDS)
     }
 
-    private fun insideForwardArea(where: GeoPoint): Boolean {
-        val here = position() ?: return false
-        return GeoMath.distanceMeters(here, where) <= limits.forwardRadiusMeters
-    }
-
     private fun transmit(eventId: String, frame: ByteArray) {
         // The same event can reach here twice at once (as the device's own, and as seen on a relay).
         val first = synchronized(lock) { transmitting.add(eventId) }
@@ -397,7 +542,6 @@ class RoadMeshBridge(
     }
 
     private companion object {
-        const val MAX_AUTHORS = 256
         const val MAX_FRAME_DIGESTS = 512
         const val MAX_PARKED = 64
         const val MAX_PARKED_PER_REPORT = 8

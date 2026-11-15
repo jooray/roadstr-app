@@ -9,6 +9,13 @@ enum class NativeRoadEventProtocol {
 
     /** Heard on a MeshCore radio before any relay served it. Same lifetime rules as every report. */
     Interop,
+
+    /**
+     * An entry of a bridge summary heard on the radio: from a bridge, unverified. No author, no
+     * Nostr ID, no signature, so it cannot be voted on and is never published or re-sent. Its ID
+     * is `bridge:` + 16 hex digits.
+     */
+    Bridge,
 }
 
 /** A community road report (Nostr kind 1315) with its vote tally. */

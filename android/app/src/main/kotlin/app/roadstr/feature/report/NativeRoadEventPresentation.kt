@@ -28,6 +28,9 @@ enum class NativeRoadEventSource {
 
     /** Seen on both. */
     InteropRelayAndMesh,
+
+    /** An entry of a bridge summary heard on the radio: from a bridge, unverified. No author, no votes. */
+    Bridge,
 }
 
 data class NativeRoadEventAge(
@@ -147,6 +150,7 @@ object NativeRoadEventPresenter {
     const val MAX_COUNTER = 1_000_000_000
     private const val MAX_FUTURE_SKEW_SECONDS = 300L
     private val HEX_64 = Regex("^[0-9a-f]{64}$")
+    private val BRIDGE_ID = Regex("^bridge:[0-9a-f]{16}$")
     private val CONTROLS = Regex("[\\u0000-\\u001f]")
 
     fun detail(
@@ -155,8 +159,14 @@ object NativeRoadEventPresenter {
         imperial: Boolean,
     ): NativeRoadEventDetail {
         require(nowSeconds >= 0) { "Current time must be non-negative" }
-        require(HEX_64.matches(input.id)) { "Road-event id must be lowercase hex" }
-        require(HEX_64.matches(input.pubkey)) { "Road-event pubkey must be lowercase hex" }
+        val bridged = input.source == NativeRoadEventSource.Bridge
+        if (bridged) {
+            require(BRIDGE_ID.matches(input.id)) { "Bridge entry id must be bridge: and 16 hex digits" }
+            require(input.pubkey.isEmpty()) { "A bridge entry has no author" }
+        } else {
+            require(HEX_64.matches(input.id)) { "Road-event id must be lowercase hex" }
+            require(HEX_64.matches(input.pubkey)) { "Road-event pubkey must be lowercase hex" }
+        }
         input.viewerPubkey?.let {
             require(HEX_64.matches(it)) { "Viewer pubkey must be lowercase hex" }
         }
@@ -188,7 +198,7 @@ object NativeRoadEventPresenter {
         return NativeRoadEventDetail(
             id = input.id,
             pubkey = input.pubkey,
-            reporterNpub = NostrNip19.encodePublicKey(input.pubkey),
+            reporterNpub = if (bridged) "" else NostrNip19.encodePublicKey(input.pubkey),
             category = input.category,
             markerKind = markerKind(input.category),
             latitude = input.latitude,
@@ -205,7 +215,7 @@ object NativeRoadEventPresenter {
             denials = input.denials,
             zapSats = input.zapSats,
             loggedIn = input.viewerPubkey != null,
-            owner = owner,
+            owner = owner && !bridged,
             reporterPublic = input.reporterPublic,
             reporterLabel = profileLabel,
             editRequests = immutable(requests),

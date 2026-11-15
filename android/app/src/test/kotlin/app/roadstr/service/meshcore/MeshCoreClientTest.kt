@@ -94,6 +94,30 @@ class MeshCoreClientTest {
     }
 
     @Test
+    fun `a summary goes out zero-hop with path length 0, and a region is refused instead of flooded`() {
+        radio.configureRoadstrChannel(3)
+        val client = client()
+        client.start()
+        assertTrue(client.zeroHop)
+        val results = mutableListOf<MeshCoreSendResult>()
+        client.sendSummary(byteArrayOf(0x10, 1, 2), SummaryScope.ZeroHop) { results += it }
+        client.sendSummary(byteArrayOf(0x10, 1, 2), SummaryScope.Region(app.roadstr.core.geo.GeoPoint(48.1, 17.1))) { results += it }
+        scheduler.advance(0)
+        assertEquals(listOf(MeshCoreSendResult.Sent, MeshCoreSendResult.NoScope), results)
+        // 3E, channel, 00 (zero hops, no path bytes), data_type little endian, payload.
+        assertArrayEquals(byteArrayOf(0x3E, 0x03, 0x00, 0x50, 0x01, 0x10, 1, 2), radio.sentDatagrams.single())
+    }
+
+    @Test
+    fun `the radio's LoRa settings come from its self info`() {
+        radio.configureRoadstrChannel(3)
+        radio.loRa = Triple(250_000, 11, 5)
+        val client = client()
+        client.start()
+        assertEquals(app.roadstr.core.protocol.interop.LoRaSettings(11, 250_000, 5), client.loRa)
+    }
+
+    @Test
     fun `an oversize payload is refused before it reaches the radio`() {
         radio.configureRoadstrChannel()
         val client = client()

@@ -265,6 +265,20 @@ class NativeRoadEventPresentationTest {
         assertEquals(90, detail.speedLimitKmh)
     }
 
+    @Test
+    fun `a bridge entry has no author, is never the viewer's own, and keeps a bridge id`() {
+        val bridged = input(id = "bridge:0123456789abcdef", pubkey = "", viewerPubkey = PUBKEY)
+            .copy(source = NativeRoadEventSource.Bridge)
+        val detail = project(bridged)
+        assertEquals(NativeRoadEventSource.Bridge, detail.source)
+        assertEquals("", detail.reporterNpub)
+        assertFalse(detail.owner)
+        val forged = runCatching { project(bridged.copy(pubkey = PUBKEY)) }
+        assertTrue("a bridge entry cannot claim an author", forged.isFailure)
+        val notBridge = runCatching { project(input(id = "bridge:0123456789abcdef", pubkey = "")) }
+        assertTrue("a bridge id is refused for a signed report", notBridge.isFailure)
+    }
+
     private fun project(value: NativeRoadEventInput) =
         NativeRoadEventPresenter.detail(value, NOW, imperial = false)
 

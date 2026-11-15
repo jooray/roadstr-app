@@ -32,6 +32,35 @@ The payload is the frame specified in Roadbeacon's
 [nips/road-events.md](https://github.com/jooray/roadbeacon/blob/main/nips/road-events.md); it is not
 restated here.
 
+## Relays to radio: bridge summaries
+
+The *Bridge: Nostr → radio* switch no longer puts relay events on the radio. A full report floods
+the whole mesh in a 133–181 byte packet, and the key and signature that make up most of it prove
+nothing to a driver who only has the mesh. The bridge instead sends a short, unsigned **bridge
+summary** of up to five reports, and only when someone near it uses the radio. Frames, rules and
+vectors are in Roadbeacon's
+[SPECIFICATION.md](https://github.com/jooray/roadbeacon/blob/main/SPECIFICATION.md) sections 4.2
+and 4.3 and in [`vectors/road-bridge-v1.json`](vectors/road-bridge-v1.json), which
+`BridgeSummaryCodecVectorsTest` runs. In short:
+
+- same `data_type` `0x0150`; the first byte is `0x10` (summary, 13 + 8·k bytes, up to five entries
+  of position, category, age, remaining time and vote counts) or `0x20` (a 13-byte request from a
+  driver without internet); version-0 decoders refuse both;
+- off by default, and only on demand: a signed frame from another node heard within 25 km in the
+  last two hours, or a request;
+- one summary per geohash-4 area per 30 minutes (10 after a request), at most six per hour and
+  0.1 % airtime per hour, after a random 2–10 s wait;
+- zero-hop on the BLE link when the demand was heard at 0 hops; through MeshCore Open always
+  region-scoped, with the region `regions.resolve` gives for the point; otherwise nothing is sent,
+  never a plain flood;
+- before sending, an ephemeral kind-21315 claim on the relays, signed by a random key made for each
+  start of the bridge; fewest hops wins, then the lowest SHA-256(pubkey ‖ area);
+- votes never go to the radio. Entries heard from another bridge are shown as "From a bridge,
+  unverified", cannot be voted on or zapped, and are never published or re-sent. A verified report
+  of the same category within 100 m replaces them.
+
+The §8 rules for Nostr → radio below are obsolete.
+
 ## Current transport option: MeshCore Open's local API
 
 A MeshCore companion radio has one BLE connection. Instead of taking it over, Roadstr can use the
@@ -510,7 +539,7 @@ All of it is **off by default**, and each direction is its own switch.
 | *Receive reports from the radio* | decode, verify and show what is heard |
 | *Send my reports by radio* | the device's own compatible reports and votes go on the radio (needs consent) |
 | *Bridge: radio → Nostr* | republish what is heard to the relays, with the original author (needs consent) |
-| *Bridge: Nostr → radio* | broadcast nearby compatible reports from the relays (needs consent and *send*) |
+| *Bridge: Nostr → radio* | bridge summaries only, see [Relays to radio](#relays-to-radio-bridge-summaries) (needs consent and *send*) |
 
 **Radio → Nostr.** A datagram is rebuilt and verified (§3.4), its timestamp and age checked, shown, and — if
 enabled and the relays do not already have it — queued for the relays. The event is published **unchanged**:

@@ -86,6 +86,7 @@ import app.roadstr.service.meshcore.AndroidMeshCoreBleLink
 import app.roadstr.service.meshcore.AndroidMeshCoreScanner
 import app.roadstr.service.meshcore.MeshCoreBlePermissions
 import app.roadstr.service.meshcore.MeshRuntime
+import app.roadstr.service.meshcore.NostrBridgeClaims
 import app.roadstr.service.nostr.NativeNostrWire
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -757,6 +758,12 @@ open class NativeRoadTestActivity : ComponentActivity() {
             localApiIdentity = AndroidKeystoreLocalApiIdentity(storeNames.alias("meshlocalapi")),
             cursorStorage = storage,
             clientVersion = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull().orEmpty(),
+            // A fresh random key per start: claims never carry the driver's identity.
+            claims = NostrBridgeClaims(
+                connector = NativeRelayConnectorSelector(OkHttpRelayConnector()),
+                relays = NativeRoadEventService.DEFAULT_RELAYS,
+                nowSeconds = NativeNostrWire::nowSeconds,
+            ),
         )
         return NativeShellMesh(
             runtime = runtime,

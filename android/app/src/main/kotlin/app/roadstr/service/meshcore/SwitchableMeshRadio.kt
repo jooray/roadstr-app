@@ -1,5 +1,6 @@
 package app.roadstr.service.meshcore
 
+import app.roadstr.core.protocol.interop.LoRaSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -71,6 +72,13 @@ class SwitchableMeshRadio(
 
     /** Goes to the link active now; a result from a link switched away from still reaches [onResult]. */
     override fun send(payload: ByteArray, onResult: (MeshCoreSendResult) -> Unit) = current().send(payload, onResult)
+
+    override val zeroHop: Boolean get() = current().zeroHop
+
+    override val loRa: LoRaSettings? get() = current().loRa
+
+    override fun sendSummary(payload: ByteArray, scope: SummaryScope, onResult: (MeshCoreSendResult) -> Unit) =
+        current().sendSummary(payload, scope, onResult)
 
     /** Switches at once; the old link is stopped first so only one of them owns the radio. */
     fun setMode(local: Boolean) {

@@ -30,6 +30,9 @@ class FakeMeshCoreRadio(
     private val outbox = ArrayDeque<ByteArray>()
     var answerNothingTo: Set<Int> = emptySet()
 
+    /** bandwidth (Hz), spreading factor, coding rate written into self info; null leaves them 0. */
+    var loRa: Triple<Int, Int, Int>? = null
+
     override fun open(listener: MeshCoreLink.Listener) {
         openCount++
         this.listener = listener
@@ -108,6 +111,11 @@ class FakeMeshCoreRadio(
         val frame = ByteArray(58)
         frame[0] = P.PACKET_SELF_INFO.toByte()
         for (i in 0 until 32) frame[4 + i] = (0xA0 + i % 16).toByte()
+        loRa?.let { (bw, sf, cr) ->
+            for (i in 0 until 4) frame[52 + i] = (bw ushr (8 * i)).toByte()
+            frame[56] = sf.toByte()
+            frame[57] = cr.toByte()
+        }
         return frame + name.toByteArray()
     }
 

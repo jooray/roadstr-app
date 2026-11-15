@@ -329,6 +329,70 @@ class LocalApiMeshClientTest {
     }
 
     @Test
+    @Suppress("UNCHECKED_CAST")
+    fun `a summary goes out only inside the region MeshCore Open resolves, never as a plain flood`() {
+        accept()
+        val client = client()
+        client.start()
+        val ws = socket()
+        val subscribe = approve(
+            ws,
+            device = linkedMapOf("name" to "T-Deck", "radio" to linkedMapOf("bwHz" to 62_500, "sf" to 8, "cr" to 8)),
+        )
+        ws.json("id" to subscribe["id"], "ok" to true, "result" to linkedMapOf("subscriptionId" to "s1"))
+        eventually("ready") { client.ready }
+        assertEquals(app.roadstr.core.protocol.interop.LoRaSettings(8, 62_500, 8), client.loRa)
+        assertFalse(client.zeroHop)
+
+        val results = LinkedBlockingQueue<MeshCoreSendResult>()
+        client.sendSummary(ByteArray(13), SummaryScope.ZeroHop) { results += it }
+        assertEquals(MeshCoreSendResult.NoScope, results.poll(1, TimeUnit.SECONDS))
+
+        val point = app.roadstr.core.geo.GeoPoint(48.15, 17.11)
+        client.sendSummary(ByteArray(13) { 0x10 }, SummaryScope.Region(point)) { results += it }
+        val resolve = next()
+        assertEquals("regions.resolve", resolve["method"])
+        assertEquals(48.15, ((resolve["params"] as Map<String, Any?>)["lat"] as Number).toDouble(), 1e-9)
+        ws.json("id" to resolve["id"], "ok" to true, "result" to linkedMapOf("region" to linkedMapOf("name" to "sk-ba", "distanceKm" to 3)))
+        val send = next()
+        assertEquals("channel.sendData", send["method"])
+        assertEquals("sk-ba", (send["params"] as Map<String, Any?>)["region"])
+        ws.json("id" to send["id"], "ok" to true, "result" to linkedMapOf("queued" to true))
+        assertEquals(MeshCoreSendResult.Sent, results.poll(5, TimeUnit.SECONDS))
+
+        client.sendSummary(ByteArray(13) { 0x10 }, SummaryScope.Region(point)) { results += it }
+        val again = next()
+        ws.json("id" to again["id"], "ok" to true, "result" to linkedMapOf("region" to null))
+        assertEquals("no region: not sent at all", MeshCoreSendResult.NoScope, results.poll(5, TimeUnit.SECONDS))
+        quiet("nothing was sent without a region")
+        client.stop()
+    }
+
+    @Test
+    fun `this phone's own sends are not delivered as heard on the radio`() {
+        accept()
+        val client = client()
+        client.start()
+        val ws = socket()
+        handshake(ws)
+        eventually("ready") { client.ready }
+        val payload = Base64.getEncoder().encodeToString(ByteArray(13) { 0x10 })
+        ws.json(
+            "type" to "event", "subscriptionId" to "s1",
+            "event" to linkedMapOf("type" to "channel.data", "channel" to "#roadstr", "dataType" to 0x0150, "payload" to payload, "outgoing" to true, "receivedAt" to "2026-11-15T10:00:00.000Z"),
+        )
+        ws.json(
+            "type" to "event", "subscriptionId" to "s1",
+            "event" to linkedMapOf("type" to "channel.data", "channel" to "#roadstr", "dataType" to 0x0150, "payload" to payload, "outgoing" to false, "hops" to 0, "receivedAt" to "2026-11-15T10:00:01.000Z"),
+        )
+        eventually("the received one arrives") { datagrams.size == 1 }
+        Thread.sleep(200)
+        assertEquals(1, datagrams.size)
+        assertEquals(0, datagrams.single().hops)
+        client.stop()
+    }
+
+    @Test
     fun `a denied app backs off for a minute and says it is not approved`() {
         accept()
         val client = client()

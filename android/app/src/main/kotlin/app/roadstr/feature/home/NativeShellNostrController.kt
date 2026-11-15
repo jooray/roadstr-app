@@ -300,6 +300,8 @@ class NativeShellReportController(
     }
 
     fun vote(eventId: String, stillThere: Boolean) {
+        // An unverified bridge entry has no Nostr ID to vote on.
+        if (eventId.startsWith(BRIDGE_ID_PREFIX)) return
         scope.launch {
             val pubkey = nostr.signer.pubkeyHex
             if (pubkey == null) {
@@ -321,7 +323,7 @@ class NativeShellReportController(
      * that only the owner's client can turn into an update.
      */
     fun editSpeedLimit(event: NativeRoadEvent, speedKmh: Int) {
-        if (speedKmh !in 5..300) return
+        if (speedKmh !in 5..300 || event.protocol == NativeRoadEventProtocol.Bridge) return
         scope.launch {
             val pubkey = nostr.signer.pubkeyHex
             if (pubkey == null) {
@@ -388,6 +390,8 @@ class NativeShellReportController(
             }
         }
         updateDetail = update
+        // Nobody signed a bridge entry: no profile, zaps or edit requests to look up.
+        if (event.protocol == NativeRoadEventProtocol.Bridge) return
 
         scope.launch {
             if (nostr.visibility.fetch(event.pubkey) != true) return@launch
@@ -462,6 +466,7 @@ class NativeShellReportController(
     )
 
     private fun sourceOf(event: NativeRoadEvent): NativeRoadEventSource {
+        if (event.protocol == NativeRoadEventProtocol.Bridge) return NativeRoadEventSource.Bridge
         if (event.protocol != NativeRoadEventProtocol.Interop) return NativeRoadEventSource.Roadstr
         val relay = RoadEventTransport.RELAY in event.transports
         val mesh = RoadEventTransport.MESH in event.transports
@@ -474,5 +479,6 @@ class NativeShellReportController(
 
     private companion object {
         const val MSAT_PER_SAT = 1_000L
+        const val BRIDGE_ID_PREFIX = "bridge:"
     }
 }

@@ -1,10 +1,12 @@
 package app.roadstr.service.meshcore
 
+import app.roadstr.core.protocol.interop.LoRaSettings
 import app.roadstr.core.protocol.meshcore.MeshCoreCompanionProtocol
 import app.roadstr.core.protocol.nostr.BoundedJsonParser
 import app.roadstr.core.protocol.nostr.NostrJson
 import java.net.Proxy
 import java.util.Base64
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -128,22 +130,54 @@ class LocalApiMeshClient(
     override fun send(payload: ByteArray, onResult: (MeshCoreSendResult) -> Unit) {
         if (!ready) return onResult(MeshCoreSendResult.NotReady)
         if (payload.isEmpty() || payload.size > MAX_PAYLOAD) return onResult(MeshCoreSendResult.TooLarge)
+        scope.launch { onResult(sendData(payload, region = null)) }
+    }
+
+    @Volatile
+    private var loRaSettings: LoRaSettings? = null
+
+    override val loRa: LoRaSettings? get() = loRaSettings
+
+    /**
+     * A bridge summary, region-scoped only: the local API has no zero-hop option, and a summary
+     * never goes out as a plain flood. The region is the one MeshCore Open resolves for the point
+     * (`regions.resolve`); with none, nothing is sent ([MeshCoreSendResult.NoScope]).
+     */
+    override fun sendSummary(payload: ByteArray, scope: SummaryScope, onResult: (MeshCoreSendResult) -> Unit) {
+        if (scope !is SummaryScope.Region) return onResult(MeshCoreSendResult.NoScope)
+        if (!ready) return onResult(MeshCoreSendResult.NotReady)
+        if (payload.isEmpty() || payload.size > MAX_PAYLOAD) return onResult(MeshCoreSendResult.TooLarge)
+        this.scope.launch {
+            // The JSON writer here takes no fractions (it is the deterministic Nostr one): the two
+            // coordinates are written as fixed-point text, which MeshCore Open reads as numbers.
+            val point = String.format(Locale.ROOT, "{\"lat\":%.5f,\"lon\":%.5f}", scope.point.latitude, scope.point.longitude)
+            val resolved = request("regions.resolve", emptyMap(), rawParams = point)
+                ?: return@launch onResult(MeshCoreSendResult.Lost)
+            @Suppress("UNCHECKED_CAST")
+            val region = ((resolved["result"] as? Map<String, Any?>)?.get("region") as? Map<String, Any?>)
+                ?.get("name") as? String
+            if (resolved["ok"] != true || region.isNullOrBlank() || region.length > MAX_REGION_NAME) {
+                return@launch onResult(MeshCoreSendResult.NoScope)
+            }
+            onResult(sendData(payload, region))
+        }
+    }
+
+    private suspend fun sendData(payload: ByteArray, region: String?): MeshCoreSendResult {
         val params = linkedMapOf<String, Any?>(
             "channel" to channelName(),
             "dataType" to sendDataType,
             "payload" to Base64.getEncoder().encodeToString(payload),
         )
-        scope.launch {
-            val reply = request("channel.sendData", params)
-            onResult(
-                when {
-                    reply == null -> MeshCoreSendResult.Lost
-                    reply["ok"] == true -> MeshCoreSendResult.Sent
-                    errorCode(reply) == "payload_too_large" -> MeshCoreSendResult.TooLarge
-                    errorCode(reply) == "rate_limited" -> MeshCoreSendResult.Busy
-                    else -> MeshCoreSendResult.NotReady
-                },
-            )
+        if (region != null) params["region"] = region
+        val reply = request("channel.sendData", params)
+        return when {
+            reply == null -> MeshCoreSendResult.Lost
+            reply["ok"] == true -> MeshCoreSendResult.Sent
+            errorCode(reply) == "payload_too_large" -> MeshCoreSendResult.TooLarge
+            errorCode(reply) == "rate_limited" -> MeshCoreSendResult.Busy
+            errorCode(reply) == "unknown_region" -> MeshCoreSendResult.NoScope
+            else -> MeshCoreSendResult.NotReady
         }
     }
 
@@ -353,6 +387,16 @@ class LocalApiMeshClient(
         /** `hello.device` and `device.device` are the same object; `connected` means channels resolve. */
         private fun readDevice(info: Map<String, Any?>?) {
             radioConnected = info?.get("connected") != false
+            @Suppress("UNCHECKED_CAST")
+            val radio = info?.get("radio") as? Map<String, Any?>
+            if (radio != null) {
+                val settings = LoRaSettings(
+                    spreadingFactor = (radio["sf"] as? Number)?.toInt() ?: 0,
+                    bandwidthHz = (radio["bwHz"] as? Number)?.toInt() ?: 0,
+                    codingRate = (radio["cr"] as? Number)?.toInt() ?: 0,
+                )
+                loRaSettings = settings.takeIf { it.plausible }
+            }
             val name = (info?.get("name") as? String).orEmpty().filter { it.code >= 0x20 }.take(MAX_NAME)
             device = MeshCoreDevice(
                 name = name.ifEmpty { device?.name ?: "MeshCore Open" },
@@ -495,6 +539,8 @@ class LocalApiMeshClient(
             @Suppress("UNCHECKED_CAST")
             val event = message["event"] as? Map<String, Any?> ?: return
             if (event["type"] != "channel.data") return
+            // What this phone sent itself is not something heard on the radio.
+            if (event["outgoing"] == true) return
             if (event["channel"] != channelName()) return
             if ((event["dataType"] as? Number)?.toInt() !in receiveDataTypes) return
             val encoded = event["payload"] as? String ?: return
@@ -517,7 +563,7 @@ class LocalApiMeshClient(
         }
     }
 
-    private suspend fun request(method: String, params: Map<String, Any?>): Map<String, Any?>? {
+    private suspend fun request(method: String, params: Map<String, Any?>, rawParams: String? = null): Map<String, Any?>? {
         val reply = CompletableDeferred<Map<String, Any?>?>()
         val (socket, id) = synchronized(lock) {
             val socket = session?.socket ?: return null
@@ -525,7 +571,12 @@ class LocalApiMeshClient(
             pending[id] = reply
             socket to id
         }
-        val sent = socket.send(NostrJson.encode(linkedMapOf("id" to id, "method" to method, "params" to params)))
+        val text = if (rawParams == null) {
+            NostrJson.encode(linkedMapOf("id" to id, "method" to method, "params" to params))
+        } else {
+            "{\"id\":$id,\"method\":${NostrJson.encode(method)},\"params\":$rawParams}"
+        }
+        val sent = socket.send(text)
         if (!sent) reply.complete(null)
         return try {
             withTimeoutOrNull(REQUEST_TIMEOUT_MILLIS) { reply.await() }
@@ -566,6 +617,7 @@ class LocalApiMeshClient(
         private const val MAX_NAME = 64
         private const val MAX_TIMESTAMP = 64
         private const val MAX_HOPS = 63
+        private const val MAX_REGION_NAME = 64
 
         /** A companion frame states its payload length in one byte. */
         private const val MAX_INBOUND_PAYLOAD = 255

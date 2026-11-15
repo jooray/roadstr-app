@@ -196,7 +196,8 @@ private fun RoadEventDetailPanel(
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     }
-                    if (detail.category == RoadCategoryWire.SPEED_CAMERA && detail.loggedIn) {
+                    val bridged = detail.source == NativeRoadEventSource.Bridge
+                    if (detail.category == RoadCategoryWire.SPEED_CAMERA && detail.loggedIn && !bridged) {
                         Spacer(modifier = Modifier.height(10.dp))
                         OutlinedButton(
                             onClick = { onEditSpeedLimit(revision, null) },
@@ -220,32 +221,42 @@ private fun RoadEventDetailPanel(
                     }
                     Spacer(modifier = Modifier.height(14.dp))
                     ConfirmationCounts(detail)
-                    Spacer(modifier = Modifier.height(12.dp))
-                    ReporterRow(revision, detail, onOpenReporter)
-                    if (detail.loggedIn) {
-                        Spacer(modifier = Modifier.height(16.dp))
-                        VoteActions(revision, onVote)
-                    } else {
+                    if (bridged) {
+                        // No author to show, no ID to vote on or zap: a bridge said it, nobody signed it.
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            stringResource(R.string.native_road_event_login_confirm),
+                            stringResource(R.string.native_bridge_entry_explained),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall,
                         )
-                    }
-                    Spacer(modifier = Modifier.height(12.dp))
-                    OutlinedButton(
-                        onClick = { onZap(revision) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .sizeIn(minHeight = 48.dp),
-                        border = BorderStroke(1.dp, BitcoinOrange),
-                    ) {
-                        Text("⚡ ", color = BitcoinOrange)
-                        Text(
-                            stringResource(R.string.native_road_event_zap),
-                            color = BitcoinOrange,
-                        )
+                    } else {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        ReporterRow(revision, detail, onOpenReporter)
+                        if (detail.loggedIn) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            VoteActions(revision, onVote)
+                        } else {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                stringResource(R.string.native_road_event_login_confirm),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = { onZap(revision) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .sizeIn(minHeight = 48.dp),
+                            border = BorderStroke(1.dp, BitcoinOrange),
+                        ) {
+                            Text("⚡ ", color = BitcoinOrange)
+                            Text(
+                                stringResource(R.string.native_road_event_zap),
+                                color = BitcoinOrange,
+                            )
+                        }
                     }
                 }
                 TextButton(
@@ -270,6 +281,7 @@ private fun SourceCaption(source: NativeRoadEventSource) {
         NativeRoadEventSource.InteropRelay -> R.string.native_interop_source_relay
         NativeRoadEventSource.InteropMesh -> R.string.native_interop_source_mesh
         NativeRoadEventSource.InteropRelayAndMesh -> R.string.native_interop_source_both
+        NativeRoadEventSource.Bridge -> R.string.native_interop_source_bridge
     }
     Spacer(modifier = Modifier.height(8.dp))
     Text(

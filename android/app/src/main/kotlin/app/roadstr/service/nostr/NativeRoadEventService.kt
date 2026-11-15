@@ -2,6 +2,7 @@ package app.roadstr.service.nostr
 
 import app.roadstr.core.geo.GeoMath
 import app.roadstr.core.geo.GeoPoint
+import app.roadstr.core.protocol.interop.BridgeSummaryCodec
 import app.roadstr.core.protocol.interop.CompactCoordinates
 import app.roadstr.core.protocol.interop.CompactOutcome
 import app.roadstr.core.protocol.interop.CompactRoadType
@@ -393,6 +394,7 @@ class NativeRoadEventService(
         for (precision in 4..6) {
             if (RoadstrNostrEvents.geohash(event.latitude, event.longitude, precision) !in hashes) return
         }
+        dropBridgeEntriesNear(event)
         cache[event.id] = event
         // A relay may send the report again (rotation, area replay): its votes are already here.
         if (votesByEvent.containsKey(event.id)) refreshLifetime(event.id)
@@ -497,6 +499,64 @@ class NativeRoadEventService(
 
     fun setInteropListener(listener: NativeInteropListener?) = synchronized(lock) { interopListener = listener }
 
+    // ── bridge summaries (unverified) ────────────────────────────────────────
+
+    /**
+     * Shows the entries of a bridge summary heard at [receivedAt] as unverified reports. An entry
+     * is ignored when a verified report of the same category is within 100 m; one with the ID of
+     * an earlier entry replaces it. Returns how many are shown.
+     */
+    fun acceptBridgeSummary(entries: List<BridgeSummaryCodec.Entry>, receivedAt: Long): Int = synchronized(lock) {
+        if (disposed) return@synchronized 0
+        var shown = 0
+        for (entry in entries) {
+            val type = CompactRoadType.fromValue(entry.category) ?: continue
+            val event = NativeRoadEvent(
+                id = entry.id,
+                pubkey = "",
+                category = type.nativeCategory,
+                latitude = CompactCoordinates.degrees(entry.latitudeE6),
+                longitude = CompactCoordinates.degrees(entry.longitudeE6),
+                comment = "",
+                createdAt = receivedAt - entry.ageSeconds,
+                expiresAt = receivedAt + entry.remainingSeconds,
+                confirmations = entry.stillThere,
+                denials = entry.gone,
+                protocol = NativeRoadEventProtocol.Bridge,
+                lifetimeEndsAt = receivedAt + entry.remainingSeconds,
+            )
+            val point = GeoPoint(event.latitude, event.longitude)
+            val verifiedNearby = cache.values.any {
+                it.protocol != NativeRoadEventProtocol.Bridge && it.category == event.category &&
+                    GeoMath.distanceMeters(point, GeoPoint(it.latitude, it.longitude)) <= BRIDGE_MATCH_METERS
+            }
+            if (verifiedNearby) continue
+            cache.remove(event.id)
+            cache[event.id] = event
+            shown++
+        }
+        val bridged = cache.values.filter { it.protocol == NativeRoadEventProtocol.Bridge }
+        if (bridged.size > MAX_BRIDGE_ENTRIES) {
+            bridged.sortedBy { it.createdAt }.take(bridged.size - MAX_BRIDGE_ENTRIES).forEach { cache.remove(it.id) }
+        }
+        if (shown > 0) publishState()
+        shown
+    }
+
+    /** A verified report is shown: unverified bridge entries of its category within 100 m give way. */
+    private fun dropBridgeEntriesNear(verified: NativeRoadEvent) {
+        if (verified.protocol == NativeRoadEventProtocol.Bridge) return
+        val point = GeoPoint(verified.latitude, verified.longitude)
+        cache.values.removeAll {
+            it.protocol == NativeRoadEventProtocol.Bridge && it.category == verified.category &&
+                GeoMath.distanceMeters(point, GeoPoint(it.latitude, it.longitude)) <= BRIDGE_MATCH_METERS
+        }
+    }
+
+    /** Verified reports shown now, for a bridge summary: never the unverified bridge entries. */
+    fun bridgeCandidates(): List<NativeRoadEvent> =
+        events.value.filter { it.protocol != NativeRoadEventProtocol.Bridge && NativeNostrWire.isHex32(it.id) }
+
     private fun acceptInteropReport(json: Map<String, Any?>, via: RoadEventTransport): Boolean {
         val report = (ExternalRoadReportAdapter.adaptReport(json) as? CompactOutcome.Ok)?.value ?: return false
         val now = nowSeconds()
@@ -579,6 +639,7 @@ class NativeRoadEventService(
     }
 
     private fun insertInterop(event: NativeRoadEvent) {
+        dropBridgeEntriesNear(event)
         cache[event.id] = event
         if (cache.size > MAX_CACHED_EVENTS) {
             cache.values.minByOrNull { it.createdAt }?.let { cache.remove(it.id) }
@@ -683,6 +744,7 @@ class NativeRoadEventService(
     suspend fun publishPlain(signed: Map<String, Any?>): Boolean = publisher.publish(signed)
 
     private fun addLocal(event: NativeRoadEvent) = synchronized(lock) {
+        dropBridgeEntriesNear(event)
         cache[event.id] = event
         publishState()
     }
@@ -809,6 +871,8 @@ class NativeRoadEventService(
         private const val MAX_INGRESS_EVENTS_PER_SUBSCRIPTION = 4_096
         private const val PENDING_UPDATE_TTL_SECONDS = 15L * 60L
         private const val FAR_METERS = 100_000.0
+        private const val BRIDGE_MATCH_METERS = 100.0
+        private const val MAX_BRIDGE_ENTRIES = 100
         private const val CLEANUP_INTERVAL_MILLIS = 2L * 60L * 1000L
         private const val CONFIRMATION_DELAY_MILLIS = 300L
         private const val HANDSHAKE_TIMEOUT_MILLIS = 10_000L

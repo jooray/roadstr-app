@@ -54,6 +54,8 @@ class MeshRuntime(
     clientVersion: String = "",
     /** Which link to use until the settings screen says otherwise. BLE unless the user chose. */
     startWithLocalApi: Boolean = false,
+    /** How bridges agree who sends a summary for an area; null: this bridge never sends summaries. */
+    claims: BridgeClaims? = null,
 ) {
     @Volatile
     private var configProvider: () -> MeshBridgeConfig = { MeshBridgeConfig() }
@@ -93,6 +95,8 @@ class MeshRuntime(
         position = { positionProvider() },
         nowSeconds = nowSeconds,
         scope = scope,
+        claims = claims,
+        scheduler = scheduler,
     )
 
     private val ledger = roads.ledger

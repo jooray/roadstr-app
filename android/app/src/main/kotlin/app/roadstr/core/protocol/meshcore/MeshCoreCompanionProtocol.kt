@@ -55,6 +55,7 @@ object MeshCoreCompanionProtocol {
     /** MAX_FRAME_SIZE (172) - 9: what firmware accepts as a channel-data payload. */
     const val MAX_CHANNEL_DATA_PAYLOAD = 163
     const val FLOOD = 0xFF
+    const val ZERO_HOP = 0x00
 
     /** data_type values: 0xFF00-0xFFFF are for development and need no registration. */
     const val DATA_TYPE_RESERVED = 0x0000
@@ -98,14 +99,24 @@ object MeshCoreCompanionProtocol {
     }
 
     /** Flood (no path) datagram on a channel. [payload] is opaque to the firmware. */
-    fun sendChannelData(channelIndex: Int, dataType: Int, payload: ByteArray): ByteArray {
+    fun sendChannelData(channelIndex: Int, dataType: Int, payload: ByteArray): ByteArray =
+        sendChannelData(channelIndex, dataType, payload, FLOOD)
+
+    /**
+     * Zero-hop datagram on a channel: path length 0, so the firmware sends it direct with an empty
+     * path (`BaseChatMesh::sendGroupData` -> `sendDirect`) and no repeater forwards it.
+     */
+    fun sendChannelDataZeroHop(channelIndex: Int, dataType: Int, payload: ByteArray): ByteArray =
+        sendChannelData(channelIndex, dataType, payload, ZERO_HOP)
+
+    private fun sendChannelData(channelIndex: Int, dataType: Int, payload: ByteArray, pathLength: Int): ByteArray {
         require(channelIndex in 0 until CHANNEL_SLOTS) { "channel slot out of range" }
         require(dataType in 1..0xFFFF) { "data_type 0 is reserved" }
         require(payload.size <= MAX_CHANNEL_DATA_PAYLOAD) { "payload larger than the firmware accepts" }
         return byteArrayOf(
             CMD_SEND_CHANNEL_DATA.toByte(),
             channelIndex.toByte(),
-            FLOOD.toByte(),
+            pathLength.toByte(),
             (dataType and 0xFF).toByte(),
             (dataType ushr 8).toByte(),
         ) + payload
@@ -122,7 +133,14 @@ object MeshCoreCompanionProtocol {
 
         data class Error(val code: Int?) : Inbound
 
-        data class SelfInfo(val publicKeyPrefix: String, val name: String) : Inbound
+        data class SelfInfo(
+            val publicKeyPrefix: String,
+            val name: String,
+            /** LoRa settings, when the frame is long enough to carry them (bytes 52..57). */
+            val spreadingFactor: Int? = null,
+            val bandwidthHz: Int? = null,
+            val codingRate: Int? = null,
+        ) : Inbound
 
         data class DeviceInfo(
             val firmwareCode: Int,
@@ -187,7 +205,15 @@ object MeshCoreCompanionProtocol {
         if (frame.size < 36) return null
         val key = frame.copyOfRange(4, 36).joinToString("") { "%02x".format(it) }
         val name = if (frame.size > 58) text(frame, 58, frame.size) else ""
-        return Inbound.SelfInfo(publicKeyPrefix = key.take(12), name = name)
+        // lat, lon, multi acks, advert policy, telemetry, manual add (36..47), freq (48), bw in Hz (52), sf, cr.
+        if (frame.size < 58) return Inbound.SelfInfo(publicKeyPrefix = key.take(12), name = name)
+        return Inbound.SelfInfo(
+            publicKeyPrefix = key.take(12),
+            name = name,
+            spreadingFactor = frame[56].toInt() and 0xFF,
+            bandwidthHz = uint32le(frame, 52).toInt(),
+            codingRate = frame[57].toInt() and 0xFF,
+        )
     }
 
     private fun parseDeviceInfo(frame: ByteArray): Inbound.DeviceInfo? {

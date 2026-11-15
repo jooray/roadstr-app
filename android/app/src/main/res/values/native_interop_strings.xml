@@ -3,6 +3,8 @@
     <string name="native_interop_source_relay">Road report from the Nostr network</string>
     <string name="native_interop_source_mesh">Road report received over MeshCore radio</string>
     <string name="native_interop_source_both">Road report seen on Nostr and on MeshCore radio</string>
+    <string name="native_interop_source_bridge">From a bridge, unverified</string>
+    <string name="native_bridge_entry_explained">A bridge heard this on the Nostr relays and summed it up on the radio. Nobody signed it, so it cannot be checked, confirmed or zapped.</string>
     <string name="native_mesh_section">MeshCore — Experimental</string>
     <string name="native_mesh_desc">Exchange road reports over a MeshCore LoRa radio, with or without internet. Anyone in radio range can read what is sent: position, time and the public key that signed it. It is neither private nor anonymous. A valid signature proves which key signed a report, not that the report is true. Not tested on real radios yet.</string>
     <string name="native_mesh_unsupported">This device has no Bluetooth LE, so a MeshCore radio cannot be used.</string>
@@ -44,7 +46,7 @@
     <string name="native_mesh_bridge_nostr">Bridge: radio to Nostr</string>
     <string name="native_mesh_bridge_nostr_desc">Republishes reports heard on the radio to the relays, still signed by their original authors. Kept and retried while offline.</string>
     <string name="native_mesh_bridge_radio">Bridge: Nostr to radio</string>
-    <string name="native_mesh_bridge_radio_desc">Broadcasts nearby reports from the relays on the radio, a few per hour. Needs sending.</string>
+    <string name="native_mesh_bridge_radio_desc">When someone nearby uses the radio, sends them a short unsigned summary of up to five reports from the relays: at most once per half hour per area, only to nearby radios or within a flood region, never votes. Needs sending.</string>
     <string name="native_mesh_setup_channel">Set up the Roadstr channel on the radio</string>
     <string name="native_mesh_clear_queue">Clear the waiting queue (%1$d)</string>
     <string name="native_mesh_forget">Forget this radio</string>
@@ -55,6 +57,6 @@
     <string name="native_mesh_cancel">Cancel</string>
     <string name="native_mesh_permission_denied">Roadstr needs the “Nearby devices” permission to find a radio.</string>
     <string name="native_mesh_consent_title">Transmit by radio?</string>
-    <string name="native_mesh_consent_body">What goes out on the radio can be received by anyone in range, with or without internet: the position of the report, its time and the public key that signed it (yours). It is not anonymous.\n\nThe bridges also pass other people\'s reports between the radio and the Nostr relays, always with their original author. A valid signature proves the key, not that the report is true.\n\nYou can switch every radio feature off at any time, and clear what is waiting to be published.</string>
+    <string name="native_mesh_consent_body">What goes out on the radio can be received by anyone in range, with or without internet: the position of the report, its time and the public key that signed it (yours). It is not anonymous.\n\nBridges also republish other people\'s reports from the radio to the Nostr relays, always with their original author. Towards the radio they send only short unsigned summaries, shown as unverified. A valid signature proves the key, not that the report is true.\n\nYou can switch every radio feature off at any time, and clear what is waiting to be published.</string>
     <string name="native_mesh_consent_accept">I understand, turn it on</string>
 </resources>

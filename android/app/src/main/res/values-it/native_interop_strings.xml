@@ -3,6 +3,8 @@
     <string name="native_interop_source_relay">Segnalazione dalla rete Nostr</string>
     <string name="native_interop_source_mesh">Segnalazione ricevuta via radio MeshCore</string>
     <string name="native_interop_source_both">Segnalazione vista su Nostr e via radio MeshCore</string>
+    <string name="native_interop_source_bridge">Da un bridge, non verificata</string>
+    <string name="native_bridge_entry_explained">Un bridge l\'ha vista sui relay Nostr e l\'ha riassunta via radio. Nessuno l\'ha firmata, quindi non si può verificare, confermare né zappare.</string>
     <string name="native_mesh_section">MeshCore — Sperimentale</string>
     <string name="native_mesh_desc">Scambia segnalazioni stradali tramite una radio LoRa MeshCore, con o senza internet. Chiunque sia nel raggio radio può leggere ciò che viene inviato: posizione, ora e la chiave pubblica che l\'ha firmato. Non è né privato né anonimo. Una firma valida prova quale chiave ha firmato una segnalazione, non che sia vera. Non ancora provato su radio reali.</string>
     <string name="native_mesh_unsupported">Questo dispositivo non ha Bluetooth LE: non si può usare una radio MeshCore.</string>
@@ -44,7 +46,7 @@
     <string name="native_mesh_bridge_nostr">Bridge: radio verso Nostr</string>
     <string name="native_mesh_bridge_nostr_desc">Ripubblica sui relay le segnalazioni ascoltate via radio, sempre firmate dai loro autori originali. Conservate e ritentate se sei offline.</string>
     <string name="native_mesh_bridge_radio">Bridge: Nostr verso radio</string>
-    <string name="native_mesh_bridge_radio_desc">Trasmette via radio le segnalazioni vicine che arrivano dai relay, poche all\'ora. Richiede l\'invio.</string>
+    <string name="native_mesh_bridge_radio_desc">Quando qualcuno vicino usa la radio, gli invia un breve riepilogo non firmato di al massimo cinque segnalazioni dai relay: al massimo una volta ogni mezz\'ora per zona, solo alle radio vicine o dentro una regione, mai i voti. Richiede l\'invio.</string>
     <string name="native_mesh_setup_channel">Configura il canale Roadstr sulla radio</string>
     <string name="native_mesh_clear_queue">Svuota la coda in attesa (%1$d)</string>
     <string name="native_mesh_forget">Dimentica questa radio</string>
@@ -55,6 +57,6 @@
     <string name="native_mesh_cancel">Annulla</string>
     <string name="native_mesh_permission_denied">Roadstr ha bisogno del permesso “Dispositivi nelle vicinanze” per trovare una radio.</string>
     <string name="native_mesh_consent_title">Trasmettere via radio?</string>
-    <string name="native_mesh_consent_body">Ciò che esce via radio può essere ricevuto da chiunque sia nel raggio, con o senza internet: la posizione della segnalazione, l\'ora e la chiave pubblica che l\'ha firmata (la tua). Non è anonimo.\n\nI bridge fanno passare anche le segnalazioni di altri tra la radio e i relay Nostr, sempre con il loro autore originale. Una firma valida prova la chiave, non che la segnalazione sia vera.\n\nPuoi spegnere ogni funzione radio in qualsiasi momento e svuotare ciò che è in attesa di essere pubblicato.</string>
+    <string name="native_mesh_consent_body">Ciò che esce via radio può essere ricevuto da chiunque sia nel raggio, con o senza internet: la posizione della segnalazione, l\'ora e la chiave pubblica che l\'ha firmata (la tua). Non è anonimo.\n\nI bridge ripubblicano anche le segnalazioni di altri dalla radio ai relay Nostr, sempre con il loro autore originale. Verso la radio inviano solo brevi riepiloghi non firmati, mostrati come non verificati. Una firma valida prova la chiave, non che la segnalazione sia vera.\n\nPuoi spegnere ogni funzione radio in qualsiasi momento e svuotare ciò che è in attesa di essere pubblicato.</string>
     <string name="native_mesh_consent_accept">Ho capito, attiva</string>
 </resources>

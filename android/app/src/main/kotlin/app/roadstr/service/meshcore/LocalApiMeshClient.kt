@@ -136,7 +136,7 @@ class LocalApiMeshClient(
     @Volatile
     private var loRaSettings: LoRaSettings? = null
 
-    /** The server listed `tx_path_data`: `channel.sendData` understands `path` ("" = zero-hop). */
+    /** `hello` listed `tx_path_data`: `channel.sendData` understands `path` ("" = zero-hop). Only `hello` counts. */
     @Volatile
     private var txPathData = false
 
@@ -440,9 +440,6 @@ class LocalApiMeshClient(
             val info = message["device"] as? Map<String, Any?> ?: return
             val wasConnected = radioConnected
             readDevice(info)
-            if (message.containsKey("capabilities")) {
-                txPathData = TX_PATH_DATA in capabilitiesOf(message)
-            }
             // An answer on its way decides by itself; nothing to start or stop here meanwhile.
             if (subscribeId != null || joinId != null) return
             if (!radioConnected) return waitFor(MeshCoreProblem.LocalApiNoRadio)
@@ -660,7 +657,8 @@ class LocalApiMeshClient(
         const val TX_PATH_DATA = "tx_path_data"
 
         /**
-         * The top-level `capabilities` array of the message (never under `server` or `device`). Missing
+         * The top-level `capabilities` array of `hello` (never under `server` or `device`, never from a
+         * later `device` message). Missing
          * means no extension is available; names this client does not know are ignored.
          */
         private fun capabilitiesOf(message: Map<String, Any?>): Set<String> =

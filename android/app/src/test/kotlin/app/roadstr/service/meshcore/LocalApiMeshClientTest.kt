@@ -443,20 +443,6 @@ class LocalApiMeshClientTest {
     }
 
     @Test
-    fun `a device message can bring tx_path_data later`() {
-        val (client, ws) = readyClient(capabilities = null)
-        assertFalse(client.zeroHop)
-        ws.json(
-            "type" to "device",
-            "device" to linkedMapOf("connected" to true, "name" to "T-Deck"),
-            "channels" to listOf(linkedMapOf("index" to 0, "name" to "#roadstr", "isPublic" to false)),
-            "capabilities" to listOf(LocalApiMeshClient.TX_PATH_DATA),
-        )
-        eventually("capability seen") { client.zeroHop }
-        client.stop()
-    }
-
-    @Test
     fun `this phone's own sends are not delivered as heard on the radio`() {
         accept()
         val client = client()

@@ -75,6 +75,8 @@ class SwitchableMeshRadio(
 
     override val zeroHop: Boolean get() = current().zeroHop
 
+    override val regionScope: Boolean get() = current().regionScope
+
     override val loRa: LoRaSettings? get() = current().loRa
 
     override fun sendSummary(payload: ByteArray, scope: SummaryScope, onResult: (MeshCoreSendResult) -> Unit) =

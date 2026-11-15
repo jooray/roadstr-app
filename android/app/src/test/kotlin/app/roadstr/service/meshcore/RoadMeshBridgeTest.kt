@@ -56,6 +56,9 @@ class RoadMeshBridgeTest {
     private lateinit var client: MeshCoreClient
     private lateinit var service: NativeRoadEventService
 
+    /** Replaces the BLE client as the bridge's radio, for links with other capabilities. */
+    private var port: MeshRadioPort? = null
+
     private fun build(): RoadMeshBridge {
         service = NativeRoadEventService(
             connector = connector,
@@ -69,7 +72,7 @@ class RoadMeshBridgeTest {
         )
         client = MeshCoreClient(radio, scheduler, { "#roadstr" }, random = Random(1), onDatagram = { bridge.onDatagram(it) })
         bridge = RoadMeshBridge(
-            radio = client,
+            radio = port ?: client,
             roads = service,
             republish = queue,
             config = { config },
@@ -480,6 +483,37 @@ class RoadMeshBridgeTest {
         holdPasses()
         assertTrue(radio.sentDatagrams.isEmpty())
         assertEquals(1, bridge.stats.value.summariesWithoutScope)
+    }
+
+    /** A link like MeshCore Open's: region scope always, zero-hop only with tx_path_data. */
+    private class ScopedPort(override val zeroHop: Boolean) : MeshRadioPort {
+        val summaries = mutableListOf<Pair<ByteArray, SummaryScope>>()
+        override val ready = true
+        override val regionScope = true
+
+        override fun send(payload: ByteArray, onResult: (MeshCoreSendResult) -> Unit) = onResult(MeshCoreSendResult.Sent)
+
+        override fun sendSummary(payload: ByteArray, scope: SummaryScope, onResult: (MeshCoreSendResult) -> Unit) {
+            summaries += payload to scope
+            onResult(MeshCoreSendResult.Sent)
+        }
+    }
+
+    @Test
+    fun `through the local API, zero-hop with tx_path_data and demand at 0 hops, region otherwise`() {
+        for ((capable, hops, expectZeroHop) in listOf(Triple(true, 0, true), Triple(false, 0, false), Triple(true, 2, false))) {
+            val link = ScopedPort(zeroHop = capable)
+            port = link
+            config = summaryConfig
+            subs = 0
+            build()
+            relayDelivers(report(key = key(1)))
+            someoneOnTheRadio(hops = hops)
+            holdPasses()
+            val scope = link.summaries.single().second
+            assertEquals("capable=$capable hops=$hops", expectZeroHop, scope == SummaryScope.ZeroHop)
+            clock += 3_600 // a fresh hour and area interval for the next round
+        }
     }
 
     @Test

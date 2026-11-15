@@ -131,6 +131,11 @@ class MeshCoreDatagram(
     val flooded: Boolean,
     /** Flood hops on the way here (0: heard from the sender's radio); null when direct or not known. */
     val hops: Int? = null,
+    /** Receive metadata a local API server may add (meshcored DESIGN 5.4); nothing depends on it yet. */
+    val path: String? = null,
+    val pathHashSize: Int? = null,
+    val routeType: String? = null,
+    val rssiDbm: Double? = null,
 )
 
 /**

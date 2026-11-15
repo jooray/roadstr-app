@@ -368,6 +368,94 @@ class LocalApiMeshClientTest {
         client.stop()
     }
 
+    private fun readyClient(capabilities: List<String>?): Pair<LocalApiMeshClient, WebSocket> {
+        accept()
+        val client = client()
+        client.start()
+        val ws = socket()
+        val subscribe = approve(ws, capabilities = capabilities.orEmpty())
+        ws.json("id" to subscribe["id"], "ok" to true, "result" to linkedMapOf("subscriptionId" to "s1"))
+        eventually("ready") { client.ready }
+        return client to ws
+    }
+
+    @Test
+    @Suppress("UNCHECKED_CAST")
+    fun `with tx_path_data a zero-hop summary goes out with an empty path and no region`() {
+        val (client, ws) = readyClient(listOf("rx_meta", LocalApiMeshClient.TX_PATH_DATA))
+        assertTrue(client.zeroHop)
+        val results = LinkedBlockingQueue<MeshCoreSendResult>()
+        client.sendSummary(ByteArray(13) { 0x10 }, SummaryScope.ZeroHop) { results += it }
+        val send = next()
+        assertEquals("channel.sendData", send["method"])
+        val params = send["params"] as Map<String, Any?>
+        assertEquals("", params["path"])
+        assertFalse("zero-hop carries no region", params.containsKey("region"))
+        ws.json("id" to send["id"], "ok" to true, "result" to linkedMapOf("queued" to true, "sendId" to "x1"))
+        assertEquals(MeshCoreSendResult.Sent, results.poll(5, TimeUnit.SECONDS))
+        client.stop()
+    }
+
+    @Test
+    fun `without tx_path_data zero-hop is never attempted, an old server would flood`() {
+        val (client, _) = readyClient(capabilities = null)
+        assertFalse(client.zeroHop)
+        assertTrue(client.regionScope)
+        val results = LinkedBlockingQueue<MeshCoreSendResult>()
+        client.sendSummary(ByteArray(13) { 0x10 }, SummaryScope.ZeroHop) { results += it }
+        assertEquals(MeshCoreSendResult.NoScope, results.poll(1, TimeUnit.SECONDS))
+        quiet("nothing sent to the server")
+        client.stop()
+    }
+
+    @Test
+    fun `an unsupported answer means nothing was sent, with no retry and no flood`() {
+        val (client, ws) = readyClient(listOf(LocalApiMeshClient.TX_PATH_DATA))
+        val results = LinkedBlockingQueue<MeshCoreSendResult>()
+        client.sendSummary(ByteArray(13) { 0x10 }, SummaryScope.ZeroHop) { results += it }
+        val send = next()
+        ws.json("id" to send["id"], "ok" to false, "error" to linkedMapOf("code" to "unsupported", "message" to "no path on this driver"))
+        assertEquals(MeshCoreSendResult.NoScope, results.poll(5, TimeUnit.SECONDS))
+        quiet("no retry, no fallback")
+        client.stop()
+    }
+
+    @Test
+    fun `capabilities count only as the top-level array of hello, and unknown names are ignored`() {
+        accept()
+        val client = client()
+        client.start()
+        val ws = socket()
+        next() // hello
+        ws.json("type" to "pairing.challenge", "protocol" to 1, "nonce" to "n0nce", "known" to true)
+        next() // pair
+        ws.json(
+            "type" to "hello", "protocol" to 1,
+            "device" to linkedMapOf("name" to "T-Deck", "capabilities" to listOf(LocalApiMeshClient.TX_PATH_DATA)),
+            "server" to linkedMapOf("name" to "meshcored", "capabilities" to listOf(LocalApiMeshClient.TX_PATH_DATA)),
+            "capabilities" to listOf("something_new", 7),
+        )
+        val subscribe = next()
+        ws.json("id" to subscribe["id"], "ok" to true, "result" to linkedMapOf("subscriptionId" to "s1"))
+        eventually("ready") { client.ready }
+        assertFalse(client.zeroHop)
+        client.stop()
+    }
+
+    @Test
+    fun `a device message can bring tx_path_data later`() {
+        val (client, ws) = readyClient(capabilities = null)
+        assertFalse(client.zeroHop)
+        ws.json(
+            "type" to "device",
+            "device" to linkedMapOf("connected" to true, "name" to "T-Deck"),
+            "channels" to listOf(linkedMapOf("index" to 0, "name" to "#roadstr", "isPublic" to false)),
+            "capabilities" to listOf(LocalApiMeshClient.TX_PATH_DATA),
+        )
+        eventually("capability seen") { client.zeroHop }
+        client.stop()
+    }
+
     @Test
     fun `this phone's own sends are not delivered as heard on the radio`() {
         accept()
@@ -383,12 +471,18 @@ class LocalApiMeshClientTest {
         )
         ws.json(
             "type" to "event", "subscriptionId" to "s1",
-            "event" to linkedMapOf("type" to "channel.data", "channel" to "#roadstr", "dataType" to 0x0150, "payload" to payload, "outgoing" to false, "hops" to 0, "receivedAt" to "2026-11-15T10:00:01.000Z"),
+            "event" to linkedMapOf(
+                "type" to "channel.data", "channel" to "#roadstr", "dataType" to 0x0150, "payload" to payload, "outgoing" to false,
+                "hops" to 0, "path" to "", "pathHashSize" to 1, "routeType" to "flood", "rssiDbm" to -97, "receivedAt" to "2026-11-15T10:00:01.000Z",
+            ),
         )
         eventually("the received one arrives") { datagrams.size == 1 }
         Thread.sleep(200)
         assertEquals(1, datagrams.size)
         assertEquals(0, datagrams.single().hops)
+        assertEquals("", datagrams.single().path)
+        assertEquals("flood", datagrams.single().routeType)
+        assertEquals(-97.0, datagrams.single().rssiDbm!!, 0.0)
         client.stop()
     }
 

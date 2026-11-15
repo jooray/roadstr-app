@@ -99,6 +99,9 @@ interface MeshRadioPort {
     /** Whether this link can send zero-hop. */
     val zeroHop: Boolean get() = false
 
+    /** Whether this link can limit a flood to a named region. */
+    val regionScope: Boolean get() = false
+
     /** The radio's LoRa settings, for the airtime budget; null when unknown. */
     val loRa: LoRaSettings? get() = null
 
@@ -377,10 +380,11 @@ class RoadMeshBridge(
             BridgeSummaryPlanner.e6(point.latitude), BridgeSummaryPlanner.e6(point.longitude), selection.entries,
         ) as? BridgeSummaryCodec.Result.Ok)?.value ?: return bump { copy(notRepresentable = notRepresentable + 1) }
         // Zero-hop reaches the asker only if it was heard directly; otherwise the region around it.
-        val summaryScope = if (radio.zeroHop && demand.hops == 0) SummaryScope.ZeroHop else SummaryScope.Region(point)
-        if (summaryScope is SummaryScope.Region && radio.zeroHop) {
-            // The link that owns the radio has no per-message region: it would have to flood.
-            return bump { copy(summariesWithoutScope = summariesWithoutScope + 1) }
+        // A link that can do neither sends nothing: it would have to flood.
+        val summaryScope = when {
+            radio.zeroHop && demand.hops == 0 -> SummaryScope.ZeroHop
+            radio.regionScope -> SummaryScope.Region(point)
+            else -> return bump { copy(summariesWithoutScope = summariesWithoutScope + 1) }
         }
         val settings = radio.loRa ?: LoRaSettings.ASSUMED
         val packet = BridgeSummaryCodec.packetBytes(payload.size, region = summaryScope is SummaryScope.Region)

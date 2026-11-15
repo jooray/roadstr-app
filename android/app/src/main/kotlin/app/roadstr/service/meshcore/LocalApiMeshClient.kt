@@ -136,17 +136,35 @@ class LocalApiMeshClient(
     @Volatile
     private var loRaSettings: LoRaSettings? = null
 
+    /** The server listed `tx_path_data`: `channel.sendData` understands `path` ("" = zero-hop). */
+    @Volatile
+    private var txPathData = false
+
     override val loRa: LoRaSettings? get() = loRaSettings
 
     /**
-     * A bridge summary, region-scoped only: the local API has no zero-hop option, and a summary
-     * never goes out as a plain flood. The region is the one MeshCore Open resolves for the point
-     * (`regions.resolve`); with none, nothing is sent ([MeshCoreSendResult.NoScope]).
+     * Zero-hop only where the server said it understands `path`: an older MeshCore Open ignores
+     * unknown fields and would flood.
+     */
+    override val zeroHop: Boolean get() = txPathData
+
+    override val regionScope: Boolean get() = true
+
+    /**
+     * A bridge summary, never a plain flood. Zero-hop sends `path: ""` without `region` (only when
+     * the server listed `tx_path_data`). Region-scoped resolves the region for the point
+     * (`regions.resolve`) and sends with it; with none, nothing is sent. An `unsupported` answer
+     * means nothing went out, and there is no retry and no fallback ([MeshCoreSendResult.NoScope]).
      */
     override fun sendSummary(payload: ByteArray, scope: SummaryScope, onResult: (MeshCoreSendResult) -> Unit) {
-        if (scope !is SummaryScope.Region) return onResult(MeshCoreSendResult.NoScope)
         if (!ready) return onResult(MeshCoreSendResult.NotReady)
         if (payload.isEmpty() || payload.size > MAX_PAYLOAD) return onResult(MeshCoreSendResult.TooLarge)
+        if (scope is SummaryScope.ZeroHop) {
+            if (!txPathData) return onResult(MeshCoreSendResult.NoScope)
+            this.scope.launch { onResult(sendData(payload, region = null, path = "")) }
+            return
+        }
+        scope as SummaryScope.Region
         this.scope.launch {
             // The JSON writer here takes no fractions (it is the deterministic Nostr one): the two
             // coordinates are written as fixed-point text, which MeshCore Open reads as numbers.
@@ -163,20 +181,21 @@ class LocalApiMeshClient(
         }
     }
 
-    private suspend fun sendData(payload: ByteArray, region: String?): MeshCoreSendResult {
+    private suspend fun sendData(payload: ByteArray, region: String?, path: String? = null): MeshCoreSendResult {
         val params = linkedMapOf<String, Any?>(
             "channel" to channelName(),
             "dataType" to sendDataType,
             "payload" to Base64.getEncoder().encodeToString(payload),
         )
         if (region != null) params["region"] = region
+        if (path != null) params["path"] = path
         val reply = request("channel.sendData", params)
         return when {
             reply == null -> MeshCoreSendResult.Lost
             reply["ok"] == true -> MeshCoreSendResult.Sent
             errorCode(reply) == "payload_too_large" -> MeshCoreSendResult.TooLarge
             errorCode(reply) == "rate_limited" -> MeshCoreSendResult.Busy
-            errorCode(reply) == "unknown_region" -> MeshCoreSendResult.NoScope
+            errorCode(reply) == "unknown_region" || errorCode(reply) == "unsupported" -> MeshCoreSendResult.NoScope
             else -> MeshCoreSendResult.NotReady
         }
     }
@@ -381,6 +400,7 @@ class LocalApiMeshClient(
             capabilities = (message["capabilities"] as? List<*>).orEmpty().filterIsInstance<String>().toSet()
             @Suppress("UNCHECKED_CAST")
             readDevice(message["device"] as? Map<String, Any?>)
+            txPathData = TX_PATH_DATA in capabilitiesOf(message)
             subscribe()
         }
 
@@ -420,6 +440,9 @@ class LocalApiMeshClient(
             val info = message["device"] as? Map<String, Any?> ?: return
             val wasConnected = radioConnected
             readDevice(info)
+            if (message.containsKey("capabilities")) {
+                txPathData = TX_PATH_DATA in capabilitiesOf(message)
+            }
             // An answer on its way decides by itself; nothing to start or stop here meanwhile.
             if (subscribeId != null || joinId != null) return
             if (!radioConnected) return waitFor(MeshCoreProblem.LocalApiNoRadio)
@@ -556,7 +579,18 @@ class LocalApiMeshClient(
                 // Null for a direct path or our own send; a value outside a 6-bit count is not a hop count.
                 val hops = (event["hops"] as? Number)?.toInt()?.takeIf { it in 0..MAX_HOPS }
                 val snrDb = (event["snrDb"] as? Number)?.toDouble() ?: 0.0
-                onDatagram(MeshCoreDatagram(payload, snrDb = snrDb, flooded = true, hops = hops))
+                onDatagram(
+                    MeshCoreDatagram(
+                        payload,
+                        snrDb = snrDb,
+                        flooded = true,
+                        hops = hops,
+                        path = (event["path"] as? String)?.takeIf { it.length <= MAX_PATH_HEX && it.all { c -> c in HEX } },
+                        pathHashSize = (event["pathHashSize"] as? Number)?.toInt()?.takeIf { it in 1..4 },
+                        routeType = (event["routeType"] as? String)?.takeIf { it.length <= MAX_ROUTE_TYPE },
+                        rssiDbm = (event["rssiDbm"] as? Number)?.toDouble(),
+                    ),
+                )
             }
             // `since` is inclusive: the last frame comes back once more and the bridge drops it.
             (event["receivedAt"] as? String)?.takeIf { it.length <= MAX_TIMESTAMP }?.let { runCatching { writeCursor(it) } }
@@ -618,6 +652,19 @@ class LocalApiMeshClient(
         private const val MAX_TIMESTAMP = 64
         private const val MAX_HOPS = 63
         private const val MAX_REGION_NAME = 64
+        private const val MAX_PATH_HEX = 128
+        private const val MAX_ROUTE_TYPE = 16
+        private const val HEX = "0123456789abcdefABCDEF"
+
+        /** `hello.capabilities` entry: `channel.sendData` takes `path` and `pathHashSize` (meshcored DESIGN 5.5). */
+        const val TX_PATH_DATA = "tx_path_data"
+
+        /**
+         * The top-level `capabilities` array of the message (never under `server` or `device`). Missing
+         * means no extension is available; names this client does not know are ignored.
+         */
+        private fun capabilitiesOf(message: Map<String, Any?>): Set<String> =
+            (message["capabilities"] as? List<*>).orEmpty().filterIsInstance<String>().toSet()
 
         /** A companion frame states its payload length in one byte. */
         private const val MAX_INBOUND_PAYLOAD = 255

@@ -85,8 +85,9 @@ saved BLE radio is never switched over.
   allowed" and retried after a minute.
 - **Capabilities:** read once from the top-level `capabilities` array of the approved `hello`. A
   feature whose capability is absent is never used: `since` needs `replay`, `channels.join` needs
-  `channels_join`. Roadstr sends no `region` or `path`, so it needs neither `regions` nor
-  `tx_path_data`.
+  `channels_join`. A bridge summary goes out zero-hop (`path: ""`) only with `tx_path_data`, and
+  region-scoped (`regions.resolve`, then `region`) only with `regions`; without either it is not
+  sent. Signed reports carry neither `region` nor `path`.
 - **Traffic:** after every approved `hello`, `events.subscribe` for `channel.data` on `#roadstr` with
   `dataTypes` `[0x0150]`; frames are sent with `channel.sendData`, `dataType` `0x0150` (at
   most 163 bytes; see [Data type](#data-type)). Messages are handled one at a time, in order. The

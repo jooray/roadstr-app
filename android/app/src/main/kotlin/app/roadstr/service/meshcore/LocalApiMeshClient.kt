@@ -140,6 +140,10 @@ class LocalApiMeshClient(
     @Volatile
     private var txPathData = false
 
+    /** `hello` listed `regions`: `regions.resolve` exists and `channel.sendData` takes `region`. Only `hello` counts. */
+    @Volatile
+    private var regions = false
+
     override val loRa: LoRaSettings? get() = loRaSettings
 
     /**
@@ -148,7 +152,8 @@ class LocalApiMeshClient(
      */
     override val zeroHop: Boolean get() = txPathData
 
-    override val regionScope: Boolean get() = true
+    /** Region-scoped only where the server listed `regions`; without it a summary is not sent at all. */
+    override val regionScope: Boolean get() = regions
 
     /**
      * A bridge summary, never a plain flood. Zero-hop sends `path: ""` without `region` (only when
@@ -165,6 +170,7 @@ class LocalApiMeshClient(
             return
         }
         scope as SummaryScope.Region
+        if (!regions) return onResult(MeshCoreSendResult.NoScope)
         this.scope.launch {
             // The JSON writer here takes no fractions (it is the deterministic Nostr one): the two
             // coordinates are written as fixed-point text, which MeshCore Open reads as numbers.
@@ -400,7 +406,8 @@ class LocalApiMeshClient(
             capabilities = (message["capabilities"] as? List<*>).orEmpty().filterIsInstance<String>().toSet()
             @Suppress("UNCHECKED_CAST")
             readDevice(message["device"] as? Map<String, Any?>)
-            txPathData = TX_PATH_DATA in capabilitiesOf(message)
+            txPathData = TX_PATH_DATA in capabilities
+            regions = CAPABILITY_REGIONS in capabilities
             subscribe()
         }
 
@@ -656,13 +663,8 @@ class LocalApiMeshClient(
         /** `hello.capabilities` entry: `channel.sendData` takes `path` and `pathHashSize` (meshcored DESIGN 5.5). */
         const val TX_PATH_DATA = "tx_path_data"
 
-        /**
-         * The top-level `capabilities` array of `hello` (never under `server` or `device`, never from a
-         * later `device` message). Missing
-         * means no extension is available; names this client does not know are ignored.
-         */
-        private fun capabilitiesOf(message: Map<String, Any?>): Set<String> =
-            (message["capabilities"] as? List<*>).orEmpty().filterIsInstance<String>().toSet()
+        /** `hello.capabilities` entry: `regions.resolve` and `region` on sends (spec section 8.3). */
+        const val CAPABILITY_REGIONS = "regions"
 
         /** A companion frame states its payload length in one byte. */
         private const val MAX_INBOUND_PAYLOAD = 255

@@ -53,8 +53,8 @@ android {
         applicationId = "app.roadstr.roadtest"
         minSdk = 24
         targetSdk = 36
-        versionCode = 2050
-        versionName = "0.5.11-native-roadtest"
+        versionCode = 2051
+        versionName = "0.5.12-native-roadtest"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }

@@ -338,6 +338,7 @@ class LocalApiMeshClientTest {
         val subscribe = approve(
             ws,
             device = linkedMapOf("name" to "T-Deck", "radio" to linkedMapOf("bwHz" to 62_500, "sf" to 8, "cr" to 8)),
+            capabilities = listOf(LocalApiMeshClient.CAPABILITY_REGIONS),
         )
         ws.json("id" to subscribe["id"], "ok" to true, "result" to linkedMapOf("subscriptionId" to "s1"))
         eventually("ready") { client.ready }
@@ -398,7 +399,7 @@ class LocalApiMeshClientTest {
 
     @Test
     fun `without tx_path_data zero-hop is never attempted, an old server would flood`() {
-        val (client, _) = readyClient(capabilities = null)
+        val (client, _) = readyClient(listOf(LocalApiMeshClient.CAPABILITY_REGIONS))
         assertFalse(client.zeroHop)
         assertTrue(client.regionScope)
         val results = LinkedBlockingQueue<MeshCoreSendResult>()
@@ -427,7 +428,7 @@ class LocalApiMeshClientTest {
         client.start()
         val ws = socket()
         next() // hello
-        ws.json("type" to "pairing.challenge", "protocol" to 1, "nonce" to "n0nce", "known" to true)
+        ws.challenge()
         next() // pair
         ws.json(
             "type" to "hello", "protocol" to 1,
@@ -439,6 +440,27 @@ class LocalApiMeshClientTest {
         ws.json("id" to subscribe["id"], "ok" to true, "result" to linkedMapOf("subscriptionId" to "s1"))
         eventually("ready") { client.ready }
         assertFalse(client.zeroHop)
+        assertFalse(client.regionScope)
+        client.stop()
+    }
+
+    @Test
+    fun `without regions no region is resolved or sent, and a summary is not sent at all`() {
+        val (client, _) = readyClient(listOf(LocalApiMeshClient.TX_PATH_DATA, "replay", "channels_join"))
+        assertTrue(client.zeroHop)
+        assertFalse(client.regionScope)
+        val results = LinkedBlockingQueue<MeshCoreSendResult>()
+        client.sendSummary(ByteArray(13) { 0x10 }, SummaryScope.Region(app.roadstr.core.geo.GeoPoint(48.70, 21.25))) { results += it }
+        assertEquals(MeshCoreSendResult.NoScope, results.poll(1, TimeUnit.SECONDS))
+        quiet("no regions.resolve and no channel.sendData")
+        client.stop()
+    }
+
+    @Test
+    fun `with no capabilities a summary has no scope at all`() {
+        val (client, _) = readyClient(capabilities = null)
+        assertFalse(client.zeroHop)
+        assertFalse(client.regionScope)
         client.stop()
     }
 

@@ -10,7 +10,8 @@ All notable Roadstr changes are documented here. Roadstr 1.0.0 is the first stab
   [specification](https://github.com/jooray/meshcore-local-api). Pairing signs the challenge's `message` only when it is exactly
   `meshcore-local-api-pair-v1:<nonce>` for the challenge's own nonce; a challenge with the old `meshcore-open-pair-v1:` prefix,
   another protocol or a malformed nonce is not signed and the connection is closed. Optional features are used only when the
-  approved `hello` lists them in `capabilities`: `since` needs `replay`, `channels.join` needs `channels_join`. Needs MeshCore Open
+  approved `hello` lists them in `capabilities`: `since` needs `replay`, `channels.join` needs `channels_join`, a zero-hop bridge summary (`path`) needs `tx_path_data`
+  and a region-scoped one (`region`) needs `regions`. Needs MeshCore Open
   `test/localapi-10` or later, or meshcored.
 
 ## [1.4.0] — 2026-11-14
